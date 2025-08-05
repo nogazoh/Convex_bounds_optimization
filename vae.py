@@ -1,7 +1,11 @@
 import torch
+from torchvision import datasets, transforms
+from joblib import Parallel, delayed
+import torch
+import os
 from torch.utils.data import Dataset
 from torchvision import datasets, transforms
-
+from joblib import Parallel, delayed
 import numpy as np
 from sklearn.model_selection import train_test_split
 import torch.utils.data
@@ -350,6 +354,10 @@ def run(model_type, alpha_pos, alpha_neg, data_name, seed):
 
 def main():
     domains = ['MNIST', 'USPS', 'SVHN']
+    # import os
+    print(os.cpu_count())
+    seeds = [1, 3, 5]
+    tasks = []
 
     for domain in domains:
         for seed in [1, 3, 5]:
@@ -363,5 +371,41 @@ def main():
             run('vrs', alpha_pos=0.5, alpha_neg=-0.5, data_name=domain,  seed=seed)
             run('vrs', alpha_pos=2, alpha_neg=-2, data_name=domain, seed=seed)
 
+def run_all():
+    domains = ['MNIST', 'USPS', 'SVHN']
+    seeds = [1, 3, 5]
+    tasks = [(domain, seed) for domain in domains for seed in seeds]
+
+    def wrapped_run(domain, seed):
+        torch.manual_seed(seed)
+
+        run('vae', alpha_pos=1, alpha_neg=-1, data_name=domain, seed=seed)
+        run('vr', alpha_pos=2, alpha_neg=-1, data_name=domain, seed=seed)
+        run('vr', alpha_pos=0.5, alpha_neg=-1, data_name=domain, seed=seed)
+        run('vr', alpha_pos=5, alpha_neg=-1, data_name=domain, seed=seed)
+        # run('vrs', alpha_pos=2, alpha_neg=-0.5, data_name=domain, seed=seed)
+        # run('vrs', alpha_pos=0.5, alpha_neg=-2, data_name=domain, seed=seed)
+        run('vrs', alpha_pos=0.5, alpha_neg=-0.5, data_name=domain, seed=seed)
+        run('vrs', alpha_pos=2, alpha_neg=-2, data_name=domain, seed=seed)
+
+    Parallel(n_jobs=os.cpu_count())(
+        delayed(wrapped_run)(domain, seed) for domain, seed in tasks
+    )
+
+
+def preload_datasets():
+    trans = transforms.ToTensor()
+
+    # USPS
+    datasets.USPS('data_USPS', train=True, download=True, transform=trans)
+    datasets.USPS('data_USPS', train=False, download=True, transform=trans)
+
+    datasets.MNIST('data_MNIST', train=True, download=True, transform=trans)
+    datasets.MNIST('data_MNIST', train=False, download=True, transform=trans)
+
+    datasets.SVHN('data_SVHN', split='train', download=True, transform=trans)
+    datasets.SVHN('data_SVHN', split='test', download=True, transform=trans)
+
 if __name__ == "__main__":
-    main()
+    preload_datasets()
+    run_all()
