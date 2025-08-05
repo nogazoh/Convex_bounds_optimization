@@ -82,7 +82,7 @@ def compute_MC_approximation(log_w_matrix, alpha, testing_mode=False):
     # loss = -ws_sum_per_datapoint
     return loss
 
-
+# VRLU
 def compute_approximation_for_negative_alpha(log_w_matrix, alpha):
     norm_log_w_matrix = log_w_matrix.view(log_w_matrix.size(0), -1)
 
@@ -357,8 +357,9 @@ def main():
             run('vae', alpha_pos=1, alpha_neg=-1, data_name=domain, seed=seed)
             run('vr', alpha_pos=2, alpha_neg=-1, data_name=domain, seed=seed)
             run('vr', alpha_pos=0.5, alpha_neg=-1, data_name=domain, seed=seed)
-            run('vrs', alpha_pos=2, alpha_neg=-0.5, data_name=domain, seed=seed)
-            run('vrs', alpha_pos=0.5, alpha_neg=-2, data_name=domain, seed=seed)
+            run('vr', alpha_pos=5, alpha_neg=-1, data_name=domain, seed=seed)
+            # run('vrs', alpha_pos=2, alpha_neg=-0.5, data_name=domain, seed=seed)
+            # run('vrs', alpha_pos=0.5, alpha_neg=-2, data_name=domain, seed=seed)
             run('vrs', alpha_pos=0.5, alpha_neg=-0.5, data_name=domain,  seed=seed)
             run('vrs', alpha_pos=2, alpha_neg=-2, data_name=domain, seed=seed)
 
