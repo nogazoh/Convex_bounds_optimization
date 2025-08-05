@@ -2,6 +2,9 @@ import torch
 from torchvision import datasets, transforms
 from joblib import Parallel, delayed
 import torch
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
+
 import os
 from torch.utils.data import Dataset
 from torchvision import datasets, transforms
