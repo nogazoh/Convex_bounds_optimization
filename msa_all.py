@@ -1,30 +1,27 @@
 from __future__ import print_function
-
 import time
-
 import torch.utils.data
-
 import torch.utils.data
-
 import logging
-
 from sklearn.metrics import accuracy_score
 import pandas
 from scipy import stats
-
 import torch.utils.data
 from sklearn.neighbors import KernelDensity
 from sklearn.model_selection import GridSearchCV
-
 from dc import *
 import classifier as ClSFR
 import matplotlib.pyplot as plt
 from vae import *
 import data as Data
 import os
+from joblib import Parallel, delayed
+import torch
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("device = ", device)
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+torch.set_num_threads(1)
 
 
 def build_DP_model_Classes(data_loaders, data_size, source_domains, models, classifiers, test_path, normalize_factors,
@@ -334,67 +331,135 @@ def run_domain_adaptation(alpha_pos, alpha_neg, vr_model_type, seed, test_path, 
             fp.write('\t'.join(target_domains_score))
 
 
+def task_run(date, seed, estimate_prob_type, init_z_method, multi_dim,
+             model_type, pos_alpha, neg_alpha,
+             classifiers, source_domains):
+
+    test_path = (
+        f'./{estimate_prob_type}_results_{date}/'
+        f'init_z_{init_z_method}/use_multi_dim_{multi_dim}/seed_{seed}/'
+        f'model_type_{model_type}___pos_alpha_{pos_alpha}___neg_alpha_{neg_alpha}'
+    )
+    os.makedirs(test_path, exist_ok=True)
+
+    run_domain_adaptation(
+        pos_alpha, neg_alpha, model_type, seed, test_path,
+        estimate_prob_type, init_z_method, multi_dim,
+        classifiers, source_domains
+    )
+
+
+# def main():
+
+#     domains_accuracy_score = []
+#     classifiers = {}
+#     source_domains = ['MNIST', 'USPS', 'SVHN']
+#     for domain in source_domains:
+#         # Load classifiers
+#         _, test_loader = Data.get_data_loaders(domain, seed=1)
+
+#         classifier = ClSFR.Grey_32_64_128_gp().to(device)
+#         classifier.load_state_dict(
+#             torch.load("./classifiers_new/{}_classifier.pt".format(domain), map_location=torch.device(device)))
+#         accuracy = ClSFR.test(classifier, test_loader)
+
+#         domains_accuracy_score.append(domain + " = " + str(accuracy))
+#         classifiers[domain] = classifier
+
+#     with open(r'./domain_accuracy_score.txt', 'w') as fp:
+#         fp.write('\n'.join(domains_accuracy_score))
+
+
+#     # estimate_prob_types = ["GMSA", "OURS-KDE", "OURS-STD-SCORE"]
+#     estimate_prob_types = ["OURS-STD-SCORE-WITH-KDE"]
+#     # estimate_prob_types = ["OURS-STD-SCORE"]
+#     # init_z_methods = ["err", "obj"]
+#     init_z_methods = ["err"]
+#     multi_dim_vals = [True]
+
+#     date = '25_2'
+
+#     for seed in [10]:
+#         for estimate_prob_type in estimate_prob_types:
+#             for init_z_method in init_z_methods:
+#                 for multi_dim in multi_dim_vals:
+#                     model_type = 'vrs'
+#                     # for (pos_alpha, neg_alpha) in [(0.5, -0.5), (2, -2), (0.5, -2), (2, -0.5)]:
+#                     for (pos_alpha, neg_alpha) in [(0.5, -0.5)]:
+
+#                         test_path = './{}_results_{}/init_z_{}/use_multi_dim_{}/seed_{}/model_type_{}___pos_alpha_{}___neg_alpha_{}'.format(
+#                             estimate_prob_type, date, init_z_method, multi_dim, seed, model_type, pos_alpha, neg_alpha)
+#                         os.makedirs(test_path, exist_ok=True)
+#                         run_domain_adaptation(pos_alpha, neg_alpha, model_type, seed, test_path, estimate_prob_type,
+#                                               init_z_method, multi_dim, classifiers, source_domains)
+
+#                     # model_type = 'vr_pos'
+#                     # for pos_alpha, neg_alpha in [(0.5, -2), (2, -0.5)]:
+#                     #     test_path = './{}_results_{}/init_z_{}/use_multi_dim_{}/seed_{}/model_type_{}___pos_alpha_{}___neg_alpha_{}'.format(
+#                     #         estimate_prob_type, date, init_z_method, multi_dim, seed, model_type, pos_alpha, neg_alpha)
+#                     #     os.makedirs(test_path, exist_ok=True)
+#                     #     run_domain_adaptation(pos_alpha, neg_alpha, model_type, seed, test_path, estimate_prob_type,
+#                     #                           init_z_method, multi_dim, classifiers, source_domains)
+#                     #
+#                     # model_type = 'vae'
+#                     # pos_alpha = 2
+#                     # neg_alpha = -0.5
+#                     # test_path = './{}_results_{}/init_z_{}/use_multi_dim_{}/seed_{}/model_type_{}___pos_alpha_{}___neg_alpha_{}'.format(
+#                     #     estimate_prob_type, date, init_z_method, multi_dim, seed, model_type, pos_alpha, neg_alpha)
+#                     # os.makedirs(test_path, exist_ok=True)
+#                     # run_domain_adaptation(pos_alpha, neg_alpha, model_type, seed, test_path, estimate_prob_type,
+#                     #                       init_z_method, multi_dim, classifiers, source_domains)
+
 def main():
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("device = ", device)
 
     domains_accuracy_score = []
     classifiers = {}
     source_domains = ['MNIST', 'USPS', 'SVHN']
     for domain in source_domains:
-        # Load classifiers
         _, test_loader = Data.get_data_loaders(domain, seed=1)
 
         classifier = ClSFR.Grey_32_64_128_gp().to(device)
         classifier.load_state_dict(
-            torch.load("./classifiers_new/{}_classifier.pt".format(domain), map_location=torch.device(device)))
+            torch.load(f"./classifiers_new/{domain}_classifier.pt", map_location=torch.device(device))
+        )
         accuracy = ClSFR.test(classifier, test_loader)
-
         domains_accuracy_score.append(domain + " = " + str(accuracy))
         classifiers[domain] = classifier
 
-    with open(r'./domain_accuracy_score.txt', 'w') as fp:
+    with open('./domain_accuracy_score.txt', 'w') as fp:
         fp.write('\n'.join(domains_accuracy_score))
 
+    estimate_prob_types = ["OURS-STD-SCORE-WITH-KDE"] 
+    init_z_methods = ["err"]                          
+    multi_dim_vals  = [True]                          
 
-    # estimate_prob_types = ["GMSA", "OURS-KDE", "OURS-STD-SCORE"]
-    estimate_prob_types = ["OURS-STD-SCORE-WITH-KDE"]
-    # estimate_prob_types = ["OURS-STD-SCORE"]
-    # init_z_methods = ["err", "obj"]
-    init_z_methods = ["err"]
-    multi_dim_vals = [True]
+    date  = '26_9'
+    seeds = [10]                                     
 
-    date = '25_2'
+    alphas_by_model = {
+        "vrs": [(2, -2), (2, -0.5), (0.5, -2), (0.5, -0.5)],
+        "vr":  [(2, -1), (0.5, -1)],                 
+        "vae": [(1, -1)],                       
+    }
 
-    for seed in [10]:
+    tasks = []
+    for seed in seeds:
         for estimate_prob_type in estimate_prob_types:
             for init_z_method in init_z_methods:
                 for multi_dim in multi_dim_vals:
-                    model_type = 'vrs'
-                    # for (pos_alpha, neg_alpha) in [(0.5, -0.5), (2, -2), (0.5, -2), (2, -0.5)]:
-                    for (pos_alpha, neg_alpha) in [(0.5, -0.5)]:
+                    for model_type, pairs in alphas_by_model.items():
+                        for (pos_alpha, neg_alpha) in pairs:
+                            tasks.append((
+                                date, seed, estimate_prob_type, init_z_method, multi_dim,
+                                model_type, pos_alpha, neg_alpha
+                            ))
 
-                        test_path = './{}_results_{}/init_z_{}/use_multi_dim_{}/seed_{}/model_type_{}___pos_alpha_{}___neg_alpha_{}'.format(
-                            estimate_prob_type, date, init_z_method, multi_dim, seed, model_type, pos_alpha, neg_alpha)
-                        os.makedirs(test_path, exist_ok=True)
-                        run_domain_adaptation(pos_alpha, neg_alpha, model_type, seed, test_path, estimate_prob_type,
-                                              init_z_method, multi_dim, classifiers, source_domains)
-
-                    # model_type = 'vr_pos'
-                    # for pos_alpha, neg_alpha in [(0.5, -2), (2, -0.5)]:
-                    #     test_path = './{}_results_{}/init_z_{}/use_multi_dim_{}/seed_{}/model_type_{}___pos_alpha_{}___neg_alpha_{}'.format(
-                    #         estimate_prob_type, date, init_z_method, multi_dim, seed, model_type, pos_alpha, neg_alpha)
-                    #     os.makedirs(test_path, exist_ok=True)
-                    #     run_domain_adaptation(pos_alpha, neg_alpha, model_type, seed, test_path, estimate_prob_type,
-                    #                           init_z_method, multi_dim, classifiers, source_domains)
-                    #
-                    # model_type = 'vae'
-                    # pos_alpha = 2
-                    # neg_alpha = -0.5
-                    # test_path = './{}_results_{}/init_z_{}/use_multi_dim_{}/seed_{}/model_type_{}___pos_alpha_{}___neg_alpha_{}'.format(
-                    #     estimate_prob_type, date, init_z_method, multi_dim, seed, model_type, pos_alpha, neg_alpha)
-                    # os.makedirs(test_path, exist_ok=True)
-                    # run_domain_adaptation(pos_alpha, neg_alpha, model_type, seed, test_path, estimate_prob_type,
-                    #                       init_z_method, multi_dim, classifiers, source_domains)
-
+    Parallel(n_jobs=os.cpu_count(), backend="loky")(
+        delayed(task_run)(*t, classifiers, source_domains) for t in tasks
+    )
 
 
 if __name__ == "__main__":

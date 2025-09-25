@@ -337,59 +337,82 @@ def run(model_type, alpha_pos, alpha_neg, data_name, seed):
     print(datetime.datetime.now())
     print("Training finished")
 
-    path = "./models_{}".format(data_name, seed)
-    os.makedirs(path, exist_ok=True)
+    # path = "./models_{}".format(data_name, seed)
+    # os.makedirs(path, exist_ok=True)
 
-    torch.save(train_losses,
-               path + "/{}_{}_{}_{}_train_losses.pt".format(model_type, alpha_pos, alpha_neg, data_name))
-    torch.save(train_recon_losses,
-               path + "/{}_{}_{}_{}_train_recon_losses.pt".format(model_type, alpha_pos, alpha_neg, data_name))
-    torch.save(train_log_p_vals,
-               path + "/{}_{}_{}_{}_train_log_p_vals.pt".format(model_type, alpha_pos, alpha_neg, data_name))
-    torch.save(test_losses,
-               path + "/{}_{}_{}_{}_test_losses.pt".format(model_type, alpha_pos, alpha_neg, data_name))
-    torch.save(test_recon_losses,
-               path + "/{}_{}_{}_{}_test_recon_losses.pt".format(model_type, alpha_pos, alpha_neg, data_name))
-    torch.save(test_log_p_vals,
-               path + "/{}_{}_{}_{}_test_log_p_vals.pt".format(model_type, alpha_pos, alpha_neg, data_name))
-    torch.save(model.state_dict(), path + "/{}_{}_{}_{}_model.pt".format(model_type, alpha_pos, alpha_neg, data_name))
+    # torch.save(train_losses,
+    #            path + "/{}_{}_{}_{}_train_losses.pt".format(model_type, alpha_pos, alpha_neg, data_name))
+    # torch.save(train_recon_losses,
+    #            path + "/{}_{}_{}_{}_train_recon_losses.pt".format(model_type, alpha_pos, alpha_neg, data_name))
+    # torch.save(train_log_p_vals,
+    #            path + "/{}_{}_{}_{}_train_log_p_vals.pt".format(model_type, alpha_pos, alpha_neg, data_name))
+    # torch.save(test_losses,
+    #            path + "/{}_{}_{}_{}_test_losses.pt".format(model_type, alpha_pos, alpha_neg, data_name))
+    # torch.save(test_recon_losses,
+    #            path + "/{}_{}_{}_{}_test_recon_losses.pt".format(model_type, alpha_pos, alpha_neg, data_name))
+    # torch.save(test_log_p_vals,
+    #            path + "/{}_{}_{}_{}_test_log_p_vals.pt".format(model_type, alpha_pos, alpha_neg, data_name))
+    # torch.save(model.state_dict(), path + "/{}_{}_{}_{}_model.pt".format(model_type, alpha_pos, alpha_neg, data_name))
+    save_dir = "./models_new"
+    os.makedirs(save_dir, exist_ok=True)
+    base = f"{model_type}_{alpha_pos}_{alpha_neg}_{data_name}"
+    torch.save(train_losses,        f"{save_dir}/{base}_train_losses.pt")
+    torch.save(train_recon_losses,  f"{save_dir}/{base}_train_recon_losses.pt")
+    torch.save(train_log_p_vals,    f"{save_dir}/{base}_train_log_p_vals.pt")
+    torch.save(test_losses,         f"{save_dir}/{base}_test_losses.pt")
+    torch.save(test_recon_losses,   f"{save_dir}/{base}_test_recon_losses.pt")
+    torch.save(test_log_p_vals,     f"{save_dir}/{base}_test_log_p_vals.pt")
+    torch.save(model.state_dict(),  f"{save_dir}/{base}_model.pt")
+    print(f"[SAVED] {save_dir}/{base}_model.pt")
 
 
-def main():
-    domains = ['MNIST', 'USPS', 'SVHN']
-    # import os
-    print(os.cpu_count())
-    seeds = [1, 3, 5]
-    tasks = []
 
-    for domain in domains:
-        for seed in [1, 3, 5]:
-            torch.manual_seed(seed)
-            run('vae', alpha_pos=1, alpha_neg=-1, data_name=domain, seed=seed)
-            run('vr', alpha_pos=2, alpha_neg=-1, data_name=domain, seed=seed)
-            run('vr', alpha_pos=0.5, alpha_neg=-1, data_name=domain, seed=seed)
-            run('vr', alpha_pos=5, alpha_neg=-1, data_name=domain, seed=seed)
-            # run('vrs', alpha_pos=2, alpha_neg=-0.5, data_name=domain, seed=seed)
-            # run('vrs', alpha_pos=0.5, alpha_neg=-2, data_name=domain, seed=seed)
-            run('vrs', alpha_pos=0.5, alpha_neg=-0.5, data_name=domain,  seed=seed)
-            run('vrs', alpha_pos=2, alpha_neg=-2, data_name=domain, seed=seed)
+
+
+# def main():
+#     domains = ['MNIST', 'USPS', 'SVHN']
+#     # import os
+#     print(os.cpu_count())
+#     seeds = [1, 3, 5]
+#     tasks = []
+
+#     for domain in domains:
+#         for seed in [1, 3, 5]:
+#             torch.manual_seed(seed)
+#             # VAE
+#             run('vae', alpha_pos=1, alpha_neg=-1, data_name=domain, seed=seed)
+
+#             # VR
+#             run('vr', alpha_pos=2, alpha_neg=-1, data_name=domain, seed=seed)     # VR2
+#             run('vr', alpha_pos=0.5, alpha_neg=-1, data_name=domain, seed=seed)  # VR0.5
+
+#             # VRS
+#             run('vrs', alpha_pos=2, alpha_neg=-2, data_name=domain, seed=seed)       # VRS2,-2
+#             run('vrs', alpha_pos=2, alpha_neg=-0.5, data_name=domain, seed=seed)     # VRS2,-0.5
+#             run('vrs', alpha_pos=0.5, alpha_neg=-2, data_name=domain, seed=seed)     # VRS0.5,-2
+#             run('vrs', alpha_pos=0.5, alpha_neg=-0.5, data_name=domain, seed=seed)   # VRS0.5,-0.5
 
 def run_all():
     domains = ['MNIST', 'USPS', 'SVHN']
-    seeds = [1, 3, 5]
+    seeds = [1] #, 3, 5]
     tasks = [(domain, seed) for domain in domains for seed in seeds]
 
     def wrapped_run(domain, seed):
         torch.manual_seed(seed)
 
+        # VAE
         run('vae', alpha_pos=1, alpha_neg=-1, data_name=domain, seed=seed)
-        run('vr', alpha_pos=2, alpha_neg=-1, data_name=domain, seed=seed)
-        run('vr', alpha_pos=0.5, alpha_neg=-1, data_name=domain, seed=seed)
-        run('vr', alpha_pos=5, alpha_neg=-1, data_name=domain, seed=seed)
-        # run('vrs', alpha_pos=2, alpha_neg=-0.5, data_name=domain, seed=seed)
-        # run('vrs', alpha_pos=0.5, alpha_neg=-2, data_name=domain, seed=seed)
-        run('vrs', alpha_pos=0.5, alpha_neg=-0.5, data_name=domain, seed=seed)
-        run('vrs', alpha_pos=2, alpha_neg=-2, data_name=domain, seed=seed)
+
+        # VR
+        run('vr', alpha_pos=2, alpha_neg=-1, data_name=domain, seed=seed)     # VR2
+        run('vr', alpha_pos=0.5, alpha_neg=-1, data_name=domain, seed=seed)  # VR0.5
+
+        # VRS
+        run('vrs', alpha_pos=2, alpha_neg=-2, data_name=domain, seed=seed)       # VRS2,-2
+        run('vrs', alpha_pos=2, alpha_neg=-0.5, data_name=domain, seed=seed)     # VRS2,-0.5
+        run('vrs', alpha_pos=0.5, alpha_neg=-2, data_name=domain, seed=seed)     # VRS0.5,-2
+        run('vrs', alpha_pos=0.5, alpha_neg=-0.5, data_name=domain, seed=seed)   # VRS0.5,-0.5
+
 
     Parallel(n_jobs=os.cpu_count())(
         delayed(wrapped_run)(domain, seed) for domain, seed in tasks
