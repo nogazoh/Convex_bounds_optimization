@@ -24,7 +24,21 @@ import torch.nn.functional as F
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("device = ", device)
+N_JOBS = min(16, os.cpu_count() or 16)
 
+def configure_per_process_threads():
+    """
+    Limit BLAS/OpenMP/PyTorch threads inside each training process to avoid
+    oversubscription when using joblib.Parallel.
+    Call this once before spawning processes.
+    """
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    try:
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
 
 def elbo(model, x, z, mu, logstd, gamma=1):
     # decoded
@@ -203,6 +217,10 @@ class vr_model(nn.Module):
             loss = elbo(model, x, z, mu, logstd)
         elif model_type == "vr":
             loss = renyi_bound("vr", model, x, z, mu, logstd, model.alpha_pos, K, testing_mode)
+        elif model_type == "vrlu":  # ← חדש
+            loss = renyi_bound("vr_ub", model, x, z, mu, logstd,
+                               model.alpha_neg, K, testing_mode)  # ← שימוש ב‑alpha_neg
+
         elif model_type == "vrs":
             loss = renyi_bound_sandwich(model, x, z, mu, logstd, model.alpha_pos, model.alpha_neg, K, testing_mode)
 
@@ -294,7 +312,19 @@ def test(model, epoch, test_loader, model_type, losses, recon_losses, log_p_vals
 
 def run(model_type, alpha_pos, alpha_neg, data_name, seed):
     learning_rate = 0.001
-    testing_frequency = 50
+    testing_frequency = 1
+
+    path = f"./models_{data_name}_seed{seed}_1"
+    os.makedirs(path, exist_ok=True)
+
+    filename_prefix = f"{model_type}_{alpha_pos}_{alpha_neg}_{data_name}_seed{seed}"
+    model_file_path = os.path.join(path, f"{filename_prefix}_model.pt")
+
+    if os.path.exists(model_file_path):
+        print(f"[SKIP] {filename_prefix} already exists. Skipping.")
+        return
+
+    print(f"[START] {filename_prefix}")
 
     train_losses, test_losses = [], []
     train_recon_losses, test_recon_losses = [], []
@@ -305,54 +335,45 @@ def run(model_type, alpha_pos, alpha_neg, data_name, seed):
 
     train_loader, test_loader = Data.get_data_loaders(data_name, seed)
 
-
     print(datetime.datetime.now())
-    eps = 1e-4
+    eps = 1e-2
     epoch = 0
     testing_cnt = 0
     while True:
-        if epoch > 300:
+        if epoch > 220:
             break
 
-        # stop learning condition
         if testing_cnt >= 3 and test_losses[-1] >= test_losses[-2] and test_losses[-2] >= test_losses[-3]:
             break
 
-        # stop learning condition
         if len(train_losses) >= 3 and np.abs(train_losses[-1] - train_losses[-2]) <= eps and \
                 np.abs(train_losses[-2] - train_losses[-3]) <= eps:
             break
 
-        train_losses, train_recon_losses, train_log_p_vals = train(model, optimizer, epoch, train_loader,
-                                                                   model_type, train_losses, train_recon_losses,
-                                                                   train_log_p_vals)
+        train_losses, train_recon_losses, train_log_p_vals = train(
+            model, optimizer, epoch, train_loader,
+            model_type, train_losses, train_recon_losses, train_log_p_vals
+        )
+
         if epoch % testing_frequency == 1:
-            test_losses, test_recon_losses, test_log_p_vals = test(model, epoch, test_loader,
-                                                                   model_type, test_losses, test_recon_losses,
-                                                                   test_log_p_vals)
+            test_losses, test_recon_losses, test_log_p_vals = test(
+                model, epoch, test_loader,
+                model_type, test_losses, test_recon_losses, test_log_p_vals
+            )
             testing_cnt += 1
 
         epoch += 1
 
     print(datetime.datetime.now())
-    print("Training finished")
+    print(f"[DONE] {filename_prefix}")
 
-    path = "./models_{}".format(data_name, seed)
-    os.makedirs(path, exist_ok=True)
-
-    torch.save(train_losses,
-               path + "/{}_{}_{}_{}_train_losses.pt".format(model_type, alpha_pos, alpha_neg, data_name))
-    torch.save(train_recon_losses,
-               path + "/{}_{}_{}_{}_train_recon_losses.pt".format(model_type, alpha_pos, alpha_neg, data_name))
-    torch.save(train_log_p_vals,
-               path + "/{}_{}_{}_{}_train_log_p_vals.pt".format(model_type, alpha_pos, alpha_neg, data_name))
-    torch.save(test_losses,
-               path + "/{}_{}_{}_{}_test_losses.pt".format(model_type, alpha_pos, alpha_neg, data_name))
-    torch.save(test_recon_losses,
-               path + "/{}_{}_{}_{}_test_recon_losses.pt".format(model_type, alpha_pos, alpha_neg, data_name))
-    torch.save(test_log_p_vals,
-               path + "/{}_{}_{}_{}_test_log_p_vals.pt".format(model_type, alpha_pos, alpha_neg, data_name))
-    torch.save(model.state_dict(), path + "/{}_{}_{}_{}_model.pt".format(model_type, alpha_pos, alpha_neg, data_name))
+    torch.save(train_losses,          os.path.join(path, f"{filename_prefix}_train_losses.pt"))
+    torch.save(train_recon_losses,    os.path.join(path, f"{filename_prefix}_train_recon_losses.pt"))
+    torch.save(train_log_p_vals,      os.path.join(path, f"{filename_prefix}_train_log_p_vals.pt"))
+    torch.save(test_losses,           os.path.join(path, f"{filename_prefix}_test_losses.pt"))
+    torch.save(test_recon_losses,     os.path.join(path, f"{filename_prefix}_test_recon_losses.pt"))
+    torch.save(test_log_p_vals,       os.path.join(path, f"{filename_prefix}_test_log_p_vals.pt"))
+    torch.save(model.state_dict(),    model_file_path)
 
 
 def main():
@@ -365,16 +386,17 @@ def main():
     for domain in domains:
         for seed in [1, 3, 5]:
             torch.manual_seed(seed)
-            run('vae', alpha_pos=1, alpha_neg=-1, data_name=domain, seed=seed)
-            run('vr', alpha_pos=2, alpha_neg=-1, data_name=domain, seed=seed)
-            run('vr', alpha_pos=0.5, alpha_neg=-1, data_name=domain, seed=seed)
-            run('vr', alpha_pos=5, alpha_neg=-1, data_name=domain, seed=seed)
-            # run('vrs', alpha_pos=2, alpha_neg=-0.5, data_name=domain, seed=seed)
-            # run('vrs', alpha_pos=0.5, alpha_neg=-2, data_name=domain, seed=seed)
-            run('vrs', alpha_pos=0.5, alpha_neg=-0.5, data_name=domain,  seed=seed)
-            run('vrs', alpha_pos=2, alpha_neg=-2, data_name=domain, seed=seed)
+            # run('vae', alpha_pos=1, alpha_neg=-1, data_name=domain, seed=seed)
+            # run('vr', alpha_pos=2, alpha_neg=-1, data_name=domain, seed=seed)
+            # run('vr', alpha_pos=0.5, alpha_neg=-1, data_name=domain, seed=seed)
+            # run('vr', alpha_pos=5, alpha_neg=-1, data_name=domain, seed=seed)
+            # run('vrs', alpha_pos=0.5, alpha_neg=-0.5, data_name=domain,  seed=seed)
+            # run('vrs', alpha_pos=2, alpha_neg=-2, data_name=domain, seed=seed)
+            run('vrlu', alpha_pos=0.5, alpha_neg=-0.5, data_name=domain, seed=seed)
+
 
 def run_all():
+    configure_per_process_threads()
     domains = ['MNIST', 'USPS', 'SVHN']
     seeds = [1, 3, 5]
     tasks = [(domain, seed) for domain in domains for seed in seeds]
@@ -386,14 +408,16 @@ def run_all():
         run('vr', alpha_pos=2, alpha_neg=-1, data_name=domain, seed=seed)
         run('vr', alpha_pos=0.5, alpha_neg=-1, data_name=domain, seed=seed)
         run('vr', alpha_pos=5, alpha_neg=-1, data_name=domain, seed=seed)
-        # run('vrs', alpha_pos=2, alpha_neg=-0.5, data_name=domain, seed=seed)
-        # run('vrs', alpha_pos=0.5, alpha_neg=-2, data_name=domain, seed=seed)
-        run('vrs', alpha_pos=0.5, alpha_neg=-0.5, data_name=domain, seed=seed)
+        run('vrs', alpha_pos=0.5, alpha_neg=-0.5, data_name=domain,  seed=seed)
         run('vrs', alpha_pos=2, alpha_neg=-2, data_name=domain, seed=seed)
+        run('vrlu', alpha_pos=0.5, alpha_neg=-0.5, data_name=domain, seed=seed)
 
-    Parallel(n_jobs=os.cpu_count())(
-        delayed(wrapped_run)(domain, seed) for domain, seed in tasks
-    )
+    Parallel(
+        n_jobs=N_JOBS,
+        backend="loky",  # process-based
+        prefer="processes",
+        batch_size=1  # avoid big task batching
+    )([delayed(wrapped_run)(domain, seed) for domain, seed in tasks])
 
 
 def preload_datasets():
@@ -410,5 +434,6 @@ def preload_datasets():
     datasets.SVHN('data_SVHN', split='test', download=True, transform=trans)
 
 if __name__ == "__main__":
+    configure_per_process_threads()
     preload_datasets()
     run_all()
