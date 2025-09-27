@@ -398,12 +398,13 @@ def main():
 def run_all():
     configure_per_process_threads()
     domains = ['MNIST', 'USPS', 'SVHN']
-    seeds = [1, 3, 5]
+    seeds = [1] #, 3, 5]
     tasks = [(domain, seed) for domain in domains for seed in seeds]
 
     def wrapped_run(domain, seed):
         torch.manual_seed(seed)
 
+        # VAE
         run('vae', alpha_pos=1, alpha_neg=-1, data_name=domain, seed=seed)
         run('vr', alpha_pos=2, alpha_neg=-1, data_name=domain, seed=seed)
         run('vr', alpha_pos=0.5, alpha_neg=-1, data_name=domain, seed=seed)

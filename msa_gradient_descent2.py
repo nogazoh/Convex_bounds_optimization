@@ -1,32 +1,29 @@
 from __future__ import print_function
-
 import time
-
 import torch.utils.data
-
 import torch.utils.data
-
 import logging
-
 from sklearn.metrics import accuracy_score
 import pandas
 from scipy import stats
-
 import torch.utils.data
 from sklearn.neighbors import KernelDensity
 from sklearn.model_selection import GridSearchCV
 from sklearn.linear_model import SGDClassifier
-
+from joblib import Parallel, delayed
 from dc import *
 import classifier as ClSFR
 import matplotlib.pyplot as plt
 from vae import *
 import data as Data
 import os
+import torch
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("device = ", device)
 estimate_prob_type = "OURS"
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+torch.set_num_threads(1)
 
 def build_DP_model_Classes(data_loaders, data_size, source_domains, models, classifiers):
     C = 10  # num_classes
@@ -61,8 +58,8 @@ def build_DP_model_Classes(data_loaders, data_size, source_domains, models, clas
                     x_hat, _, _ = models[source_domain](data)
                     log_p = models[source_domain].compute_log_probabitility_bernoulli(x_hat,
                                                                                       data.view(data.shape[0], -1))
-                    # prob = torch.exp(log_p)
-                    prob = torch.abs(log_p)
+                    prob = torch.exp(log_p)
+                    # prob = torch.abs(log_p) # changed that
                     prob_tile = torch.tile(prob[:, None], (1, C))
                     D[i:i + N, :, k] = prob_tile.cpu().detach().numpy()
 
@@ -158,55 +155,120 @@ def run_domain_adaptation(alpha_pos, alpha_neg, vr_model_type, seed, test_path, 
             target_domains_score.append("\n")
             fp.write('\t'.join(target_domains_score))
 
+def task_run(date, seed, sgd_alpha, sgd_max_iter,
+             model_type, pos_alpha, neg_alpha,
+             classifiers, source_domains):
+
+    test_path = (
+        f'./Results_____{date}/'
+        f'seed_{seed}__sgd_alpha_{sgd_alpha}__sgd_max_iter_{sgd_max_iter}/'
+        f'model_type_{model_type}___pos_alpha_{pos_alpha}___neg_alpha_{neg_alpha}'
+    )
+    os.makedirs(test_path, exist_ok=True)
+
+    run_domain_adaptation(pos_alpha, neg_alpha, model_type, seed, test_path,
+                          classifiers, source_domains, sgd_alpha, sgd_max_iter)
+
+
+# def main():
+
+#     domains_accuracy_score = []
+#     classifiers = {}
+#     source_domains = ['MNIST', 'USPS', 'SVHN']
+#     for domain in source_domains:
+#         # Load classifiers
+#         _, test_loader = Data.get_data_loaders(domain, seed=1)
+
+#         classifier = ClSFR.Grey_32_64_128_gp().to(device)
+#         classifier.load_state_dict(
+#             torch.load("./classifiers_new/{}_classifier.pt".format(domain), map_location=torch.device(device)))
+#         accuracy = ClSFR.test(classifier, test_loader)
+
+#         domains_accuracy_score.append(domain + " = " + str(accuracy))
+#         classifiers[domain] = classifier
+
+#     with open(r'./domain_accuracy_score.txt', 'w') as fp:
+#         fp.write('\n'.join(domains_accuracy_score))
+
+#     date = '26_9'
+
+#     for seed in [48]:
+#         for sgd_alpha in [1e-5]:
+#             for sgd_max_iter in [2000]:
+
+#                 # -------- VRS-SGD --------
+#                 model_type = 'vrs'
+#                 for (pos_alpha, neg_alpha) in [(2, -2), (2, -0.5), (0.5, -2), (0.5, -0.5)]:
+#                     test_path = './Results_____{}/seed_{}__sgd_alpha_{}__sgd_max_iter_{}/model_type_{}___pos_alpha_{}___neg_alpha_{}'.format(
+#                         date, seed, sgd_alpha, sgd_max_iter, model_type, pos_alpha, neg_alpha)
+#                     os.makedirs(test_path, exist_ok=True)
+#                     run_domain_adaptation(pos_alpha, neg_alpha, model_type, seed, test_path,
+#                                         classifiers, source_domains, sgd_alpha, sgd_max_iter)
+
+#                 # -------- VR-SGD --------
+#                 model_type = 'vr'
+#                 for (pos_alpha, neg_alpha) in [(2, -1), (0.5, -1)]:  
+#                     test_path = './Results_____{}/seed_{}__sgd_alpha_{}__sgd_max_iter_{}/model_type_{}___pos_alpha_{}___neg_alpha_{}'.format(
+#                         date, seed, sgd_alpha, sgd_max_iter, model_type, pos_alpha, neg_alpha)
+#                     os.makedirs(test_path, exist_ok=True)
+#                     run_domain_adaptation(pos_alpha, neg_alpha, model_type, seed, test_path,
+#                                         classifiers, source_domains, sgd_alpha, sgd_max_iter)
+
+#                 # -------- VAE-SGD --------
+#                 model_type = 'vae'
+#                 pos_alpha, neg_alpha = 1, -1
+#                 test_path = './Results_____{}/seed_{}__sgd_alpha_{}__sgd_max_iter_{}/model_type_{}___pos_alpha_{}___neg_alpha_{}'.format(
+#                     date, seed, sgd_alpha, sgd_max_iter, model_type, pos_alpha, neg_alpha)
+#                 os.makedirs(test_path, exist_ok=True)
+#                 run_domain_adaptation(pos_alpha, neg_alpha, model_type, seed, test_path,
+#                                     classifiers, source_domains, sgd_alpha, sgd_max_iter)
 
 def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("device = ", device)
 
     domains_accuracy_score = []
     classifiers = {}
     source_domains = ['MNIST', 'USPS', 'SVHN']
     for domain in source_domains:
-        # Load classifiers
         _, test_loader = Data.get_data_loaders(domain, seed=1)
-
         classifier = ClSFR.Grey_32_64_128_gp().to(device)
-        classifier.load_state_dict(
-            torch.load("./classifiers_new/{}_classifier.pt".format(domain), map_location=torch.device(device)))
+        classifier.load_state_dict(torch.load(f"./classifiers_new/{domain}_classifier.pt",
+                                              map_location=torch.device(device)))
         accuracy = ClSFR.test(classifier, test_loader)
-
         domains_accuracy_score.append(domain + " = " + str(accuracy))
         classifiers[domain] = classifier
 
-    with open(r'./domain_accuracy_score.txt', 'w') as fp:
+    with open('./domain_accuracy_score.txt', 'w') as fp:
         fp.write('\n'.join(domains_accuracy_score))
 
-    date = '19_3'
+    date = '26_9'
+    seeds = [48]
+    sgd_alphas = [1e-5]
+    sgd_max_iters = [2000]
 
-    for seed in [48]:
-        for sgd_alpha in [1e-5]:
-            for sgd_max_iter in [2000]:
-                model_type = 'vrs' #, (2, -2), (0.5, -2), (2, -0.5)
-                for (pos_alpha, neg_alpha) in [(0.5, -0.5), (2, -2), (0.5, -2), (2, -0.5), (3, -1), (1, -3)]:
+    tasks = []
 
-                    test_path = './Results_____{}/seed_{}__sgd_alpha_{}__sgd_max_iter_{}/model_type_{}___pos_alpha_{}___neg_alpha_{}'.format(
-                        date, seed, sgd_alpha, sgd_max_iter, model_type, pos_alpha, neg_alpha)
-                    os.makedirs(test_path, exist_ok=True)
-                    run_domain_adaptation(pos_alpha, neg_alpha, model_type, seed, test_path, classifiers, source_domains, sgd_alpha, sgd_max_iter)
+    # VRS-SGD 
+    for seed in seeds:
+        for sgd_alpha in sgd_alphas:
+            for sgd_max_iter in sgd_max_iters:
+                for (pos_alpha, neg_alpha) in [(2, -2), (2, -0.5), (0.5, -2), (0.5, -0.5)]:
+                    tasks.append((date, seed, sgd_alpha, sgd_max_iter,
+                                  'vrs', pos_alpha, neg_alpha))
 
-                model_type = 'vr_pos'
-                # for pos_alpha, neg_alpha in [(0.5, -2), (2, -0.5), (3, -0.5)]:
-                for pos_alpha, neg_alpha in [(0.5, -2), (2, -0.5), (3, -0.5)]:
-                    test_path = './Results_____{}/seed_{}__sgd_alpha_{}__sgd_max_iter_{}/model_type_{}___pos_alpha_{}___neg_alpha_{}'.format(
-                        date, seed, sgd_alpha, sgd_max_iter, model_type, pos_alpha, neg_alpha)
-                    os.makedirs(test_path, exist_ok=True)
-                    run_domain_adaptation(pos_alpha, neg_alpha, model_type, seed, test_path, classifiers, source_domains, sgd_alpha, sgd_max_iter)
+                # VR-SGD (VR2 VR0.5)
+                for (pos_alpha, neg_alpha) in [(2, -1), (0.5, -1)]:
+                    tasks.append((date, seed, sgd_alpha, sgd_max_iter,
+                                  'vr', pos_alpha, neg_alpha))
 
-                model_type = 'vae'
-                pos_alpha = 2
-                neg_alpha = -0.5
-                test_path = './Results_____{}/seed_{}__sgd_alpha_{}__sgd_max_iter_{}/model_type_{}___pos_alpha_{}___neg_alpha_{}'.format(
-                    date, seed, sgd_alpha, sgd_max_iter, model_type, pos_alpha, neg_alpha)
-                os.makedirs(test_path, exist_ok=True)
-                run_domain_adaptation(pos_alpha, neg_alpha, model_type, seed, test_path, classifiers, source_domains, sgd_alpha, sgd_max_iter)
+                # VAE-SGD
+                tasks.append((date, seed, sgd_alpha, sgd_max_iter,
+                              'vae', 1, -1))
+
+    Parallel(n_jobs=os.cpu_count(), backend="loky")(
+        delayed(task_run)(*t, classifiers, source_domains) for t in tasks
+    )
 
 
 

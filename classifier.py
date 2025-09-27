@@ -1,5 +1,7 @@
 import glob
 import os
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
 
 import torch
 import torch.jit
@@ -18,6 +20,7 @@ import torch.optim as optim
 import torch.utils.data
 
 import data as Data
+import torchvision.transforms as transforms
 
 num_channels = 1
 dim = 28
@@ -87,7 +90,12 @@ def train(network, optimizer, train_loader, epoch):
 
     network.train()
     for batch_idx, (data, target) in enumerate(train_loader):
+        # Ensure data is 4D: [batch, channels, height, width]
+        if data.dim() == 3:
+            data = data.unsqueeze(1)
         data = data.to(Data.device)
+        if isinstance(target, int):
+            target = torch.tensor(target)
         target = target.long().to(Data.device)
         X_sup = torch.autograd.Variable(data)
         y_sup = torch.autograd.Variable(target)
@@ -121,6 +129,9 @@ def test(network, test_loader):
     correct = 0
     with torch.no_grad():
         for data, target in test_loader:
+            # Ensure data is 4D: [batch, channels, height, width]
+            # if data.dim() == 3:
+            #     data = data.unsqueeze(1)
             data = data.to(Data.device)
             target = target.to(Data.device)
             X_sup = torch.autograd.Variable(data)
@@ -161,7 +172,8 @@ def run_classifier(domain):
     learning_rate = 0.005
     epsilon = 1e-3
 
-    train_loader, test_loader = Data.get_data(domain)
+    transform = transforms.ToTensor()
+    train_loader, test_loader = Data.get_data_loaders(domain)
     network = Grey_32_64_128_gp(10).to(Data.device)
     params = list(network.parameters())
 
@@ -193,6 +205,17 @@ def run_classifier(domain):
 
 
 if __name__ == '__main__':
-    run_classifier('MNIST')
-    run_classifier('USPS')
-    run_classifier('SVHN')
+    save_dir = os.path.join(os.path.dirname(__file__), "classifiers_new")
+    os.makedirs(save_dir, exist_ok=True)
+
+    domains = ['MNIST', 'USPS', 'SVHN']
+
+    for d in domains:
+        save_path = os.path.join(save_dir, f"{d}_classifier.pt")
+
+        if os.path.exists(save_path):
+            print(f"*** Skipping {d}, already exists at {save_path}")
+        else:
+            print(f"=== Training {d} ===")
+            acc = run_classifier(d)
+            print(f"=== Done {d}: test acc={acc:.2f}%")
