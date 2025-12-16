@@ -217,9 +217,9 @@ class vr_model(nn.Module):
             loss = elbo(model, x, z, mu, logstd)
         elif model_type == "vr":
             loss = renyi_bound("vr", model, x, z, mu, logstd, model.alpha_pos, K, testing_mode)
-        elif model_type == "vrlu":  # ← חדש
+        elif model_type == "vrlu":  
             loss = renyi_bound("vr_ub", model, x, z, mu, logstd,
-                               model.alpha_neg, K, testing_mode)  # ← שימוש ב‑alpha_neg
+                               model.alpha_neg, K, testing_mode) 
 
         elif model_type == "vrs":
             loss = renyi_bound_sandwich(model, x, z, mu, logstd, model.alpha_pos, model.alpha_neg, K, testing_mode)
@@ -405,13 +405,16 @@ def run_all():
         torch.manual_seed(seed)
 
         # VAE
-        run('vae', alpha_pos=1, alpha_neg=-1, data_name=domain, seed=seed)
-        run('vr', alpha_pos=2, alpha_neg=-1, data_name=domain, seed=seed)
-        run('vr', alpha_pos=0.5, alpha_neg=-1, data_name=domain, seed=seed)
-        run('vr', alpha_pos=5, alpha_neg=-1, data_name=domain, seed=seed)
-        run('vrs', alpha_pos=0.5, alpha_neg=-0.5, data_name=domain,  seed=seed)
-        run('vrs', alpha_pos=2, alpha_neg=-2, data_name=domain, seed=seed)
-        run('vrlu', alpha_pos=0.5, alpha_neg=-0.5, data_name=domain, seed=seed)
+        # run('vae', alpha_pos=1, alpha_neg=-1, data_name=domain, seed=seed)
+        # run('vr', alpha_pos=2, alpha_neg=-1, data_name=domain, seed=seed)
+        # run('vr', alpha_pos=0.5, alpha_neg=-1, data_name=domain, seed=seed)
+        # run('vr', alpha_pos=5, alpha_neg=-1, data_name=domain, seed=seed)
+        # run('vrs', alpha_pos=0.5, alpha_neg=-0.5, data_name=domain,  seed=seed)
+        # run('vrs', alpha_pos=2, alpha_neg=-2, data_name=domain, seed=seed)
+        # run('vrlu', alpha_pos=0.5, alpha_neg=-0.5, data_name=domain, seed=seed)
+        run('vrs', alpha_pos=2, alpha_neg=-0.5, data_name=domain, seed=seed)
+        run('vrs', alpha_pos=0.5, alpha_neg=-2, data_name=domain, seed=seed)
+
 
     Parallel(
         n_jobs=N_JOBS,

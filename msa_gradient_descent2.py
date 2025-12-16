@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 from vae import *
 import data as Data
 import os
+import glob
 import torch
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -27,9 +28,9 @@ torch.set_num_threads(1)
 
 def build_DP_model_Classes(data_loaders, data_size, source_domains, models, classifiers):
     C = 10  # num_classes
-    Y = np.zeros((data_size, C))
-    D = np.zeros((data_size, C, len(source_domains)))
-    H = np.zeros((data_size, C, len(source_domains)))
+    Y = np.zeros((data_size, C), dtype=np.float32)
+    D = np.zeros((data_size, C, len(source_domains)), dtype=np.float64)
+    H = np.zeros((data_size, C, len(source_domains)), dtype=np.float32)
 
     i = 0
     precentage = int((i / data_size) * 100)
@@ -41,10 +42,10 @@ def build_DP_model_Classes(data_loaders, data_size, source_domains, models, clas
 
             data = data.to(device)
             N = len(data)
-
-            y_vals = label.cpu().detach().numpy()
-            one_hot = np.zeros((y_vals.size, C))
-            one_hot[np.arange(y_vals.size), y_vals] = 1
+            # ---- Y (one-hot)
+            y_vals = label.detach().cpu().numpy()
+            one_hot = np.zeros((y_vals.size, C), dtype=np.float32)
+            one_hot[np.arange(y_vals.size), y_vals] = 1.0
             Y[i:i + N] = one_hot
 
             for k, source_domain in enumerate(source_domains):
@@ -58,8 +59,8 @@ def build_DP_model_Classes(data_loaders, data_size, source_domains, models, clas
                     x_hat, _, _ = models[source_domain](data)
                     log_p = models[source_domain].compute_log_probabitility_bernoulli(x_hat,
                                                                                       data.view(data.shape[0], -1))
-                    prob = torch.exp(log_p)
-                    # prob = torch.abs(log_p) # changed that
+                    # prob = torch.exp(log_p)
+                    prob = torch.abs(log_p) # changed that
                     prob_tile = torch.tile(prob[:, None], (1, C))
                     D[i:i + N, :, k] = prob_tile.cpu().detach().numpy()
 
@@ -135,10 +136,27 @@ def run_domain_adaptation(alpha_pos, alpha_neg, vr_model_type, seed, test_path, 
          ['MNIST'], ['USPS'], ['SVHN']]  # test set with singles
 
     models = {}
+    # for domain in source_domains:
+    #     model = vr_model(alpha_pos, alpha_neg).to(device)
+    #     model.load_state_dict(torch.load("./models_new/{}_{}_{}_{}_model.pt".format(
+    #         vr_model_type, alpha_pos, alpha_neg, domain), map_location=torch.device(device)))
+    #     models[domain] = model
+
     for domain in source_domains:
         model = vr_model(alpha_pos, alpha_neg).to(device)
-        model.load_state_dict(torch.load("./models_new/{}_{}_{}_{}_model.pt".format(
-            vr_model_type, alpha_pos, alpha_neg, domain), map_location=torch.device(device)))
+
+        filename = f"{vr_model_type}_{alpha_pos}_{alpha_neg}_{domain}_seed1_model.pt"
+        pattern = f"./models_{domain}_seed1*/{filename}"
+        matches = glob.glob(pattern)
+
+        if not matches:
+            print(f"⚠️ Warning: Model file not found for pattern: {pattern}")
+            continue
+
+        model_path = matches[0]  # take the first match found
+
+        print(f"✅ Loading model from {model_path}")
+        model.load_state_dict(torch.load(model_path, map_location=torch.device(device)))
         models[domain] = model
 
     clf = DC_programming(seed, models, classifiers, source_domains, test_path, sgd_alpha, sgd_max_iter)
