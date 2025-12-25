@@ -30,17 +30,23 @@ print("device = ", device)
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 torch.set_num_threads(1)
 
+# Global Cache to prevent re-running same solver configs multiple times
 Z_MEMORY_CACHE = {}
 
 
 def calculate_expected_loss_local(Y, H, D, num_sources):
+    """
+    Calculates the expected loss matrix.
+    """
     L_mat = np.zeros((num_sources, num_sources))
     for j in range(num_sources):
         if H.ndim == 3:
             pred_j = H[:, :, j]
         else:
             pred_j = H[:, j]
+
         loss_vec = np.abs(pred_j - Y)
+
         for t in range(num_sources):
             if D.ndim == 3:
                 p_t = D[:, :, t]
@@ -174,123 +180,81 @@ def build_DP_model(data_loaders, data_size, source_domains, models, classifiers,
 
 
 def run_single_optimization(solver_name, Y, D, H, source_domains, seed, init_z_method, test_path,
-                            initial_epsilon_multiplier):
+                            initial_epsilon_multiplier, initial_delta_multiplier):
     """
-    Runs solver with AUTO-RELAXATION.
-    If 'infeasible', it increases epsilon multiplier and retries.
+    Runs solver with AUTO-RELAXATION for both EPSILON (Risk) and DELTA (KL).
     """
     global Z_MEMORY_CACHE
     sources_key = tuple(sorted(source_domains))
-    # NOTE: Using initial_epsilon_multiplier in key to distinguish different starting points
-    cache_key = (solver_name, sources_key, seed, initial_epsilon_multiplier)
+    cache_key = (solver_name, sources_key, seed, initial_epsilon_multiplier, initial_delta_multiplier)
 
     if cache_key in Z_MEMORY_CACHE:
         return Z_MEMORY_CACHE[cache_key]
 
-    z_filename = f'DC_accuracy_score_{seed}_{solver_name}.txt'
-    full_path = os.path.join(test_path, z_filename)
-    should_recalculate = True
+    k = len(source_domains)
+    L_mat_temp = calculate_expected_loss_local(Y, H, D, k)
+    min_losses = np.min(L_mat_temp, axis=0)
 
-    if os.path.exists(full_path):
-        try:
-            with open(full_path, 'r') as fp:
-                first_line = fp.readline()
-                parts = first_line.strip().split('\t')
-                loaded_z_dict = {}
-                for part in parts:
-                    if '=' in part:
-                        key, val = part.split('=')
-                        domain_name = key.replace('z_', '').strip()
-                        loaded_z_dict[domain_name] = float(val)
-                z_vector = []
-                for domain in source_domains:
-                    z_vector.append(loaded_z_dict.get(domain, 0.0))
-                learned_z = np.array(z_vector)
+    # --- AUTO-RELAXATION LOOP ---
+    current_eps_mult = initial_epsilon_multiplier
+    current_delta_mult = initial_delta_multiplier
 
-                # Check if it's the uniform fallback (0.333...) which we want to improve upon
-                is_uniform = np.allclose(learned_z, np.ones(len(learned_z)) / len(learned_z), atol=1e-3)
+    max_retries = 5
+    learned_z = None
+    BASE_DELTA = 0.1
 
-                if np.sum(learned_z) == 0:
-                    print(f"   [CACHE] Found {z_filename} (invalid zeros). Recalculating...")
-                    should_recalculate = True
-                elif is_uniform and solver_name != "DC":
-                    # If we loaded a failed (uniform) result from disk, let's try to improve it!
-                    print(f"   [CACHE] Found {z_filename} (uniform fallback). Retrying with relaxation...")
-                    should_recalculate = True
-                else:
-                    print(f"   [CACHE] Loaded valid Z from {z_filename}: {learned_z}")
-                    Z_MEMORY_CACHE[cache_key] = learned_z
-                    should_recalculate = False
-                    return learned_z
-        except Exception:
-            should_recalculate = True
+    for attempt in range(max_retries):
+        EPSILONS_VEC = min_losses * current_eps_mult
+        DELTAS_VEC = [BASE_DELTA * current_delta_mult] * k
+        AVG_EPS = np.mean(EPSILONS_VEC)
+        AVG_DELTA = np.mean(DELTAS_VEC)
 
-    if should_recalculate:
-        learned_z = None
-        k = len(source_domains)
-        L_mat_temp = calculate_expected_loss_local(Y, H, D, k)
-        min_losses = np.min(L_mat_temp, axis=0)
+        CHOSEN_BACKEND = 'SCS'
 
-        # --- AUTO-RELAXATION LOOP ---
-        current_multiplier = initial_epsilon_multiplier
-        # Try up to 5 times, increasing by 20% each time (1.05 -> 1.26 -> 1.51...)
-        max_retries = 5
+        print(f"    >>> [Solver: {solver_name}] Attempt {attempt + 1}/{max_retries}")
+        print(f"        Eps Mult: {current_eps_mult:.3f} | Delta Mult: {current_delta_mult:.3f}")
 
-        for attempt in range(max_retries):
-            EPSILONS_VEC = min_losses * current_multiplier
-            DELTAS_VEC = [0.1] * k  # Keep delta constant or relax it too if needed
-            AVG_EPS = np.mean(EPSILONS_VEC)
-            AVG_DELTA = 0.1
-            CHOSEN_BACKEND = 'SCS'
+        if solver_name == "DC":
+            DP = init_problem_from_model(Y, D, H, p=k, C=10)
+            prob = ConvexConcaveProblem(DP)
+            solver = ConvexConcaveSolver(prob, seed, init_z_method)
+            z_res, _, _ = solver.solve()
+            learned_z = z_res
+            break
 
-            print(
-                f"   >>> [Solver: {solver_name}] Attempt {attempt + 1}/{max_retries} with Mult={current_multiplier:.3f}")
-            print(f"       Epsilons: {np.round(EPSILONS_VEC, 4)}")
+        elif solver_name == "CVXPY":
+            try:
+                learned_z = solve_convex_problem_mosek(
+                    Y, D, H, delta=AVG_DELTA, epsilon=AVG_EPS, solver_type=CHOSEN_BACKEND
+                )
+                if not np.allclose(learned_z, np.ones(k) / k, atol=1e-3):
+                    print("        -> Success!")
+                    break
+            except Exception as e:
+                print(f"        -> Failed: {e}")
 
-            if solver_name == "DC":
-                DP = init_problem_from_model(Y, D, H, p=k, C=10)
-                prob = ConvexConcaveProblem(DP)
-                solver = ConvexConcaveSolver(prob, seed, init_z_method)
-                z_res, _, _ = solver.solve()
-                learned_z = z_res
-                break  # DC always returns something
+        elif solver_name == "CVXPY_PER_DOMAIN":
+            try:
+                learned_z = solve_convex_problem_per_domain(
+                    Y, D, H, delta=DELTAS_VEC, epsilon=EPSILONS_VEC, solver_type=CHOSEN_BACKEND
+                )
+                if not np.allclose(learned_z, np.ones(k) / k, atol=1e-3):
+                    print("        -> Success!")
+                    break
+            except Exception as e:
+                print(f"        -> Failed: {e}")
 
-            elif solver_name == "CVXPY":
-                try:
-                    learned_z = solve_convex_problem_mosek(
-                        Y, D, H, delta=AVG_DELTA, epsilon=AVG_EPS, solver_type=CHOSEN_BACKEND
-                    )
-                    # Check if returned uniform (fallback inside solver)
-                    if not np.allclose(learned_z, np.ones(k) / k, atol=1e-3):
-                        print("       -> Success!")
-                        break  # Found a real solution!
-                except Exception as e:
-                    print(f"       -> Failed: {e}")
+        print("        -> Solver returned uniform/failed. Relaxing constraints...")
+        current_eps_mult *= 1.20
+        current_delta_mult *= 1.10
 
-            elif solver_name == "CVXPY_PER_DOMAIN":
-                try:
-                    learned_z = solve_convex_problem_per_domain(
-                        Y, D, H, delta=DELTAS_VEC, epsilon=EPSILONS_VEC, solver_type=CHOSEN_BACKEND
-                    )
-                    # Check if returned uniform (fallback inside solver)
-                    if not np.allclose(learned_z, np.ones(k) / k, atol=1e-3):
-                        print("       -> Success!")
-                        break  # Found a real solution!
-                except Exception as e:
-                    print(f"       -> Failed: {e}")
+    if learned_z is None:
+        learned_z = np.ones(k) / k
 
-            # If we are here, solver failed or returned uniform. Relax and retry.
-            print("       -> Solver returned uniform/failed. Relaxing constraints...")
-            current_multiplier *= 1.2  # Relax by 20%
+    result_tuple = (learned_z, current_eps_mult, current_delta_mult)
+    Z_MEMORY_CACHE[cache_key] = result_tuple
 
-        # If loop finishes and we still have None or Uniform, fallback is inevitable
-        if learned_z is None:
-            learned_z = np.ones(k) / k
-
-        # Update memory cache
-        Z_MEMORY_CACHE[cache_key] = learned_z
-
-        return learned_z
+    return result_tuple
 
 
 def evaluate_z_on_data(Y, D, H, learned_z, multi_dim, source_domains):
@@ -310,23 +274,34 @@ def evaluate_z_on_data(Y, D, H, learned_z, multi_dim, source_domains):
 
 def task_run(date, seed, estimate_prob_type, init_z_method, multi_dim,
              model_type, pos_alpha, neg_alpha,
-             classifiers, source_domains, epsilon_multiplier):
-    test_path = (
-        f'./{estimate_prob_type}_results_{date}_eps_{epsilon_multiplier}/'
-        f'init_z_{init_z_method}/use_multi_dim_{multi_dim}/seed_{seed}/'
-        f'model_type_{model_type}___pos_alpha_{pos_alpha}___neg_alpha_{neg_alpha}'
+             classifiers, source_domains, epsilon_multiplier, delta_multiplier):
+    # --- FIX FOR WINDOWS LONG PATHS ---
+    # 1. Use slightly truncated folder names to save characters
+    relative_path = (
+        f'./{estimate_prob_type}_{date}_eps_{epsilon_multiplier}_delta_{delta_multiplier}/'
+        f'z_{init_z_method}/md_{multi_dim}/seed_{seed}/'
+        f'{model_type}_p{pos_alpha}_n{neg_alpha}'
     )
-    os.makedirs(test_path, exist_ok=True)
+
+    # 2. Get Absolute Path
+    abs_path = os.path.abspath(relative_path)
+
+    # 3. Add Windows Long Path Prefix if necessary
+    if os.name == 'nt' and len(abs_path) > 200:
+        if not abs_path.startswith('\\\\?\\'):
+            abs_path = '\\\\?\\' + abs_path
+
+    os.makedirs(abs_path, exist_ok=True)
 
     return run_domain_adaptation(
-        pos_alpha, neg_alpha, model_type, seed, test_path,
+        pos_alpha, neg_alpha, model_type, seed, abs_path,
         estimate_prob_type, init_z_method, multi_dim,
-        classifiers, source_domains, epsilon_multiplier
+        classifiers, source_domains, epsilon_multiplier, delta_multiplier
     )
 
 
 def run_domain_adaptation(alpha_pos, alpha_neg, vr_model_type, seed, test_path, estimate_prob_type, init_z_method,
-                          multi_dim, classifiers, source_domains, epsilon_multiplier):
+                          multi_dim, classifiers, source_domains, epsilon_multiplier, delta_multiplier):
     torch.manual_seed(seed)
     np.random.seed(seed=seed)
     logging_filename = "domain_adaptation.log"
@@ -395,21 +370,31 @@ def run_domain_adaptation(alpha_pos, alpha_neg, vr_model_type, seed, test_path, 
                                            normalize_factors, estimate_prob_type)
         test_cache[domain] = (Y_t, D_t, H_t)
 
-    # 3. Solvers
+    # 3. Solvers Loop
     solvers_to_run = ["DC", "CVXPY", "CVXPY_PER_DOMAIN"]
     results_for_this_config = []
     weights_col_name = f"Weights ({', '.join(source_domains)})"
 
     for solver_name in solvers_to_run:
-        learned_z = run_single_optimization(solver_name, Y_opt, D_opt, H_opt, source_domains, seed, init_z_method,
-                                            test_path, epsilon_multiplier)
+        # Run optimization with auto-relaxation logic
+        learned_z, final_eps, final_delta = run_single_optimization(
+            solver_name, Y_opt, D_opt, H_opt, source_domains, seed, init_z_method,
+            test_path, epsilon_multiplier, delta_multiplier
+        )
+
         print(f"   > Final Z ({solver_name}): {learned_z}")
 
         z_str = "[" + ", ".join([f"{z:.3f}" for z in learned_z]) + "]"
-        z_filename = f'DC_accuracy_score_{seed}_{solver_name}.txt'
+
+        # Save Z to file, noting the final constraints used
+        z_filename = f'Result_{seed}_{solver_name}_FinalEps_{final_eps:.2f}_FinalDelta_{final_delta:.2f}.txt'
 
         with open(os.path.join(test_path, z_filename), 'w') as fp:
+            fp.write(f'# Solver: {solver_name}\n')
+            fp.write(f'# Final Epsilon Multiplier: {final_eps}\n')
+            fp.write(f'# Final Delta Multiplier: {final_delta}\n')
             fp.write(f'\nz_MNIST = {learned_z[0]}\tz_USPS = {learned_z[1]}\tz_SVHN = {learned_z[2]}\n')
+
             model_name_str = f"{vr_model_type.upper()}_{alpha_pos}_{alpha_neg}_{solver_name}"
 
             domain_stats = {}
@@ -437,7 +422,10 @@ def run_domain_adaptation(alpha_pos, alpha_neg, vr_model_type, seed, test_path, 
                     "Model": model_name_str,
                     "Target": col_key,
                     "Score": score * 100,
-                    weights_col_name: z_str
+                    weights_col_name: z_str,
+                    "Final Eps Mult": f"{final_eps:.2f}",
+                    "Final Delta Mult": f"{final_delta:.2f}",
+                    "Solver": solver_name
                 })
                 fp.write(f"{target_domains}\t{score * 100}\n")
 
@@ -447,9 +435,9 @@ def run_domain_adaptation(alpha_pos, alpha_neg, vr_model_type, seed, test_path, 
 def main():
     print("device = ", device)
 
-    # --- START WITH TIGHT EPSILON (1.05) ---
-    # The code will automatically relax it if needed
+    # --- CONFIGURATION ---
     EPSILON_MULTIPLIER = 1.05
+    DELTA_MULTIPLIER = 1.05
 
     classifiers = {}
     source_domains = ['MNIST', 'USPS', 'SVHN']
@@ -462,6 +450,7 @@ def main():
         except FileNotFoundError:
             pass
 
+    # Note: Keep the folder name reasonable length if possible
     estimate_prob_types = ["OURS-STD-SCORE-WITH-KDE"]
     init_z_methods = ["err"]
     multi_dim_vals = [True]
@@ -486,7 +475,7 @@ def main():
 
     print("\n🚀 Starting Parallel Execution (n_jobs=-1)...")
     results_lists = Parallel(n_jobs=-1, verbose=10)(
-        delayed(task_run)(*t, classifiers, source_domains, EPSILON_MULTIPLIER) for t in tasks
+        delayed(task_run)(*t, classifiers, source_domains, EPSILON_MULTIPLIER, DELTA_MULTIPLIER) for t in tasks
     )
 
     flat_results = [item for sublist in results_lists for item in sublist]
@@ -494,11 +483,16 @@ def main():
 
     if not df.empty:
         weights_col = f"Weights ({', '.join(source_domains)})"
-        final_table = df.pivot_table(index=['Model', weights_col], columns='Target', values='Score')
+
+        final_table = df.pivot_table(
+            index=['Model', 'Solver', weights_col, 'Final Eps Mult', 'Final Delta Mult'],
+            columns='Target',
+            values='Score'
+        )
         final_table['mean'] = final_table.mean(axis=1)
         final_table = final_table.round(1)
 
-        base_name = f'final_summary_results_{date}_eps_{EPSILON_MULTIPLIER}'
+        base_name = f'final_summary_results_{date}_eps_{EPSILON_MULTIPLIER}_delta_{DELTA_MULTIPLIER}'
         extension = '_COMPARISON.csv'
         version = 1
         while True:
