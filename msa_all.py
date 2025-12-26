@@ -180,23 +180,28 @@ def build_DP_model(data_loaders, data_size, source_domains, models, classifiers,
 
 
 def run_single_optimization(solver_name, Y, D, H, source_domains, seed, init_z_method, test_path,
-                            initial_epsilon_multiplier, initial_delta_multiplier):
+                            initial_delta_multiplier, fixed_epsilon_dict):
     """
-    Runs solver with AUTO-RELAXATION for both EPSILON (Risk) and DELTA (KL).
+    Runs solver with AUTO-RELAXATION for DELTA (KL) ONLY.
+    EPSILON (Risk) is FIXED from the CSV file and does not change.
     """
     global Z_MEMORY_CACHE
     sources_key = tuple(sorted(source_domains))
-    cache_key = (solver_name, sources_key, seed, initial_epsilon_multiplier, initial_delta_multiplier)
+    # Cache key: Include fixed epsilons so if CSV changes, we re-run
+    cache_key = (solver_name, sources_key, seed, initial_delta_multiplier, tuple(fixed_epsilon_dict.values()))
 
     if cache_key in Z_MEMORY_CACHE:
         return Z_MEMORY_CACHE[cache_key]
 
     k = len(source_domains)
-    L_mat_temp = calculate_expected_loss_local(Y, H, D, k)
-    min_losses = np.min(L_mat_temp, axis=0)
+    # L_mat is internal to the solver logic usually, but here we enforce external bounds.
+
+    # --- PREPARE FIXED EPSILONS ---
+    # Convert dictionary to a vector ordered by source_domains
+    # Example: [Error_MNIST, Error_USPS, Error_SVHN]
+    base_eps_vec = np.array([fixed_epsilon_dict[domain] for domain in source_domains])
 
     # --- AUTO-RELAXATION LOOP ---
-    current_eps_mult = initial_epsilon_multiplier
     current_delta_mult = initial_delta_multiplier
 
     max_retries = 5
@@ -204,17 +209,27 @@ def run_single_optimization(solver_name, Y, D, H, source_domains, seed, init_z_m
     BASE_DELTA = 0.1
 
     for attempt in range(max_retries):
-        EPSILONS_VEC = min_losses * current_eps_mult
+        # 1. Calculate Constraints
+        # EPSILON is FIXED (No multiplier applied)
+        EPSILONS_VEC = base_eps_vec
+
+        # DELTA changes with attempts
         DELTAS_VEC = [BASE_DELTA * current_delta_mult] * k
-        AVG_EPS = np.mean(EPSILONS_VEC)
-        AVG_DELTA = np.mean(DELTAS_VEC)
+
+        # For General CVXPY: Use MAX error as the single bound (Conservative)
+        SINGLE_EPS_BOUND = np.max(EPSILONS_VEC)
+        SINGLE_DELTA_BOUND = np.mean(DELTAS_VEC)
 
         CHOSEN_BACKEND = 'SCS'
 
         print(f"    >>> [Solver: {solver_name}] Attempt {attempt + 1}/{max_retries}")
-        print(f"        Eps Mult: {current_eps_mult:.3f} | Delta Mult: {current_delta_mult:.3f}")
+        print(f"        Fixed Eps Vector: {np.round(EPSILONS_VEC, 4)}")
+        print(f"        Delta Mult: {current_delta_mult:.3f} (Bound: {SINGLE_DELTA_BOUND:.4f})")
 
+        # 2. Run Specific Solver
         if solver_name == "DC":
+            # DC typically solves the unconstrained or differently formulated problem
+            # Just keeping existing logic
             DP = init_problem_from_model(Y, D, H, p=k, C=10)
             prob = ConvexConcaveProblem(DP)
             solver = ConvexConcaveSolver(prob, seed, init_z_method)
@@ -224,8 +239,9 @@ def run_single_optimization(solver_name, Y, D, H, source_domains, seed, init_z_m
 
         elif solver_name == "CVXPY":
             try:
+                # GENERAL CASE: Use MAX error as the bound
                 learned_z = solve_convex_problem_mosek(
-                    Y, D, H, delta=AVG_DELTA, epsilon=AVG_EPS, solver_type=CHOSEN_BACKEND
+                    Y, D, H, delta=SINGLE_DELTA_BOUND, epsilon=SINGLE_EPS_BOUND, solver_type=CHOSEN_BACKEND
                 )
                 if not np.allclose(learned_z, np.ones(k) / k, atol=1e-3):
                     print("        -> Success!")
@@ -235,6 +251,7 @@ def run_single_optimization(solver_name, Y, D, H, source_domains, seed, init_z_m
 
         elif solver_name == "CVXPY_PER_DOMAIN":
             try:
+                # PER DOMAIN CASE: Use the specific error vector
                 learned_z = solve_convex_problem_per_domain(
                     Y, D, H, delta=DELTAS_VEC, epsilon=EPSILONS_VEC, solver_type=CHOSEN_BACKEND
                 )
@@ -244,14 +261,15 @@ def run_single_optimization(solver_name, Y, D, H, source_domains, seed, init_z_m
             except Exception as e:
                 print(f"        -> Failed: {e}")
 
-        print("        -> Solver returned uniform/failed. Relaxing constraints...")
-        current_eps_mult *= 1.20
-        current_delta_mult *= 1.10
+        # 3. Relaxation Logic (Only Delta changes)
+        print("        -> Solver returned uniform/failed. Relaxing DELTA constraint...")
+        current_delta_mult *= 1.20  # Aggressive relaxation for Delta since Eps is fixed
 
     if learned_z is None:
         learned_z = np.ones(k) / k
 
-    result_tuple = (learned_z, current_eps_mult, current_delta_mult)
+    # Note: We return 1.0 as eps_mult just for logging consistency, though it wasn't used
+    result_tuple = (learned_z, 1.0, current_delta_mult)
     Z_MEMORY_CACHE[cache_key] = result_tuple
 
     return result_tuple
@@ -274,19 +292,24 @@ def evaluate_z_on_data(Y, D, H, learned_z, multi_dim, source_domains):
 
 def task_run(date, seed, estimate_prob_type, init_z_method, multi_dim,
              model_type, pos_alpha, neg_alpha,
-             classifiers, source_domains, epsilon_multiplier, delta_multiplier):
-    # --- FIX FOR WINDOWS LONG PATHS ---
-    # 1. Use slightly truncated folder names to save characters
+             classifiers, source_domains, delta_multiplier, fixed_epsilon_dict):
+    # --- FIX: Shorten Folder Names for Windows ---
+    prob_type_short = {
+        "OURS-STD-SCORE-WITH-KDE": "KDE",
+        "OURS-STD-SCORE": "STD",
+        "GMSA": "GMSA"
+    }.get(estimate_prob_type, "Unk")
+
+    # Shorter Path Structure
+    # Note: Eps is fixed, so we just log "FixedEps" in the folder name to avoid confusion
     relative_path = (
-        f'./{estimate_prob_type}_{date}_eps_{epsilon_multiplier}_delta_{delta_multiplier}/'
-        f'z_{init_z_method}/md_{multi_dim}/seed_{seed}/'
+        f'./Res_{date}_FixedEps_d{delta_multiplier}/'
+        f'{prob_type_short}/'
+        f'z{init_z_method}_md{int(multi_dim)}_s{seed}/'
         f'{model_type}_p{pos_alpha}_n{neg_alpha}'
     )
 
-    # 2. Get Absolute Path
     abs_path = os.path.abspath(relative_path)
-
-    # 3. Add Windows Long Path Prefix if necessary
     if os.name == 'nt' and len(abs_path) > 200:
         if not abs_path.startswith('\\\\?\\'):
             abs_path = '\\\\?\\' + abs_path
@@ -296,12 +319,12 @@ def task_run(date, seed, estimate_prob_type, init_z_method, multi_dim,
     return run_domain_adaptation(
         pos_alpha, neg_alpha, model_type, seed, abs_path,
         estimate_prob_type, init_z_method, multi_dim,
-        classifiers, source_domains, epsilon_multiplier, delta_multiplier
+        classifiers, source_domains, delta_multiplier, fixed_epsilon_dict
     )
 
 
 def run_domain_adaptation(alpha_pos, alpha_neg, vr_model_type, seed, test_path, estimate_prob_type, init_z_method,
-                          multi_dim, classifiers, source_domains, epsilon_multiplier, delta_multiplier):
+                          multi_dim, classifiers, source_domains, delta_multiplier, fixed_epsilon_dict):
     torch.manual_seed(seed)
     np.random.seed(seed=seed)
     logging_filename = "domain_adaptation.log"
@@ -309,8 +332,9 @@ def run_domain_adaptation(alpha_pos, alpha_neg, vr_model_type, seed, test_path, 
 
     target_domains_sets = [
         ['MNIST', 'USPS', 'SVHN'],
-        ['MNIST', 'USPS'], ['MNIST', 'SVHN'], ['USPS', 'SVHN'],
-        ['MNIST'], ['USPS'], ['SVHN']
+        ['MNIST', 'USPS'], ['MNIST', 'SVHN'], ['USPS', 'SVHN']
+        # ,
+        # ['MNIST'], ['USPS'], ['SVHN']
     ]
     unique_targets = ['MNIST', 'USPS', 'SVHN']
 
@@ -376,22 +400,22 @@ def run_domain_adaptation(alpha_pos, alpha_neg, vr_model_type, seed, test_path, 
     weights_col_name = f"Weights ({', '.join(source_domains)})"
 
     for solver_name in solvers_to_run:
-        # Run optimization with auto-relaxation logic
+        # Run optimization with FIXED epsilons and Auto-Relaxation for Delta
         learned_z, final_eps, final_delta = run_single_optimization(
             solver_name, Y_opt, D_opt, H_opt, source_domains, seed, init_z_method,
-            test_path, epsilon_multiplier, delta_multiplier
+            test_path, delta_multiplier, fixed_epsilon_dict
         )
 
         print(f"   > Final Z ({solver_name}): {learned_z}")
 
         z_str = "[" + ", ".join([f"{z:.3f}" for z in learned_z]) + "]"
 
-        # Save Z to file, noting the final constraints used
-        z_filename = f'Result_{seed}_{solver_name}_FinalEps_{final_eps:.2f}_FinalDelta_{final_delta:.2f}.txt'
+        # Shorter filename
+        z_filename = f'Res_{solver_name}_D{final_delta:.2f}.txt'
 
         with open(os.path.join(test_path, z_filename), 'w') as fp:
             fp.write(f'# Solver: {solver_name}\n')
-            fp.write(f'# Final Epsilon Multiplier: {final_eps}\n')
+            fp.write(f'# Fixed Epsilon (from CSV, not Multiplier)\n')
             fp.write(f'# Final Delta Multiplier: {final_delta}\n')
             fp.write(f'\nz_MNIST = {learned_z[0]}\tz_USPS = {learned_z[1]}\tz_SVHN = {learned_z[2]}\n')
 
@@ -423,7 +447,7 @@ def run_domain_adaptation(alpha_pos, alpha_neg, vr_model_type, seed, test_path, 
                     "Target": col_key,
                     "Score": score * 100,
                     weights_col_name: z_str,
-                    "Final Eps Mult": f"{final_eps:.2f}",
+                    "Final Eps Mult": "Fixed",
                     "Final Delta Mult": f"{final_delta:.2f}",
                     "Solver": solver_name
                 })
@@ -432,12 +456,46 @@ def run_domain_adaptation(alpha_pos, alpha_neg, vr_model_type, seed, test_path, 
     return results_for_this_config
 
 
+def load_fixed_epsilons(csv_path):
+    """
+    Loads the cross-domain accuracy CSV and extracts the self-error (1 - acc/100)
+    for each domain.
+    """
+    try:
+        # Assuming format: Source, Target, Accuracy
+        df = pd.read_csv(csv_path, header=None, names=['Source', 'Target', 'Accuracy'])
+
+        # Filter for rows where Source == Target (Diagonal)
+        self_performance = df[df['Source'] == df['Target']]
+
+        epsilon_dict = {}
+        for _, row in self_performance.iterrows():
+            domain = row['Source']
+            acc = row['Accuracy']
+            error = 1.0 - (acc / 100.0)  # Convert Accuracy % to Error rate (0-1)
+            epsilon_dict[domain] = error
+
+        print("Loaded Fixed Epsilons (Error Rates):", epsilon_dict)
+        return epsilon_dict
+    except Exception as e:
+        print(f"Error loading epsilon CSV: {e}")
+        return {}
+
+
 def main():
     print("device = ", device)
 
     # --- CONFIGURATION ---
-    EPSILON_MULTIPLIER = 1.05
     DELTA_MULTIPLIER = 1.05
+
+    # Load fixed epsilons from CSV
+    csv_path = 'source_models_cross_domain_accuracy.csv'
+    fixed_epsilon_dict = load_fixed_epsilons(csv_path)
+
+    if not fixed_epsilon_dict:
+        print("CRITICAL WARNING: Could not load fixed epsilons. Using defaults or crashing.")
+        # Fallback manual values if CSV fails (optional safety net)
+        fixed_epsilon_dict = {'MNIST': 0.0051, 'USPS': 0.0309, 'SVHN': 0.0566}
 
     classifiers = {}
     source_domains = ['MNIST', 'USPS', 'SVHN']
@@ -475,7 +533,7 @@ def main():
 
     print("\n🚀 Starting Parallel Execution (n_jobs=-1)...")
     results_lists = Parallel(n_jobs=-1, verbose=10)(
-        delayed(task_run)(*t, classifiers, source_domains, EPSILON_MULTIPLIER, DELTA_MULTIPLIER) for t in tasks
+        delayed(task_run)(*t, classifiers, source_domains, DELTA_MULTIPLIER, fixed_epsilon_dict) for t in tasks
     )
 
     flat_results = [item for sublist in results_lists for item in sublist]
@@ -492,7 +550,7 @@ def main():
         final_table['mean'] = final_table.mean(axis=1)
         final_table = final_table.round(1)
 
-        base_name = f'final_summary_results_{date}_eps_{EPSILON_MULTIPLIER}_delta_{DELTA_MULTIPLIER}'
+        base_name = f'final_summary_results_{date}_FixedEps_delta_{DELTA_MULTIPLIER}'
         extension = '_COMPARISON.csv'
         version = 1
         while True:
