@@ -496,10 +496,11 @@ if __name__ == "__main__":
     # plot_reconstruction_mse()
     # plot_log_likelihood_pie()
     # df = build_results_table_with_alphas(".")
-    msa_root = r"./OURS-STD-SCORE-WITH-KDE_results_26_9"
+    msa_root = r"./OURS-STD-SCORE-WITH-KDE_results_summer"
     sgd_root = r"./Results_____26_9"  # optional; pass [] if you don't want SGD rows
 
     table = build_readable_msa_table([msa_root], [sgd_root])
     print(table.to_string())          # console view
-    table.to_csv("msa_results_table.csv")  # file
+    table.to_csv("msa_results_table_retry.csv")  # file
+
 
