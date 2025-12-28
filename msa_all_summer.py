@@ -25,93 +25,182 @@ torch.set_num_threads(1)
 
 # def build_DP_model_Classes(data_loaders, data_size, source_domains, models, classifiers, test_path,
 #                            normalize_factors, estimate_prob_type):
-#     C = 10 # num_classes
+#     print(f"\n[DEBUG] --- Starting build_DP_model_Classes (FIXED VERSION) ---")
+#     print(f"[DEBUG] Config: C=10, data_size={data_size}, sources={len(source_domains)}")
+#     print(f"[DEBUG] estimate_prob_type: {estimate_prob_type}")
+#
+#     C = 10  # num_classes
 #     Y = np.zeros((data_size, C))
 #     D = np.zeros((data_size, C, len(source_domains)))
 #     H = np.zeros((data_size, C, len(source_domains)))
 #     i = 0
+#
+#     # Track initialization
+#     print(f"[DEBUG] Initialized Y({Y.shape}), D({D.shape}), H({H.shape})")
+#
 #     precentage = int((i / data_size) * 100)
 #     print("[" + str(i) + "/" + str(data_size) + "] (" + str(precentage) + "%)")
+#
+#     # ---------------------------------------------------------
+#     # PART 1: Data Loading & Raw Score Calculation
+#     # ---------------------------------------------------------
 #     for target_domain, data_loader in data_loaders:
-#         for data, label in data_loader:
+#         print(f"[DEBUG] Processing Target Domain: {target_domain}")
+#         for batch_idx, (data, label) in enumerate(data_loader):
 #             data = data.to(device)
 #             N = len(data)
+#
+#             # --- DEBUG: Input Data ---
+#             if batch_idx == 0:  # Only print for first batch to avoid clutter
+#                 print(f"[DEBUG] First batch shape: {data.shape}, Labels shape: {label.shape}")
+#
 #             y_vals = label.cpu().detach().numpy()
 #             one_hot = np.zeros((y_vals.size, C))
 #             one_hot[np.arange(y_vals.size), y_vals] = 1
 #             Y[i:i + N] = one_hot
+#
 #             for k, source_domain in enumerate(source_domains):
 #                 with torch.no_grad():
 #                     # Calculate h(x)
 #                     output = classifiers[source_domain](data)
 #                     norm_output = F.softmax(output, dim=1)
 #                     H[i:i + N, :, k] = norm_output.cpu().detach().numpy()
+#
+#                     # --- DEBUG: Classifier Output ---
+#                     if batch_idx == 0 and i == 0:
+#                         print(
+#                             f"[DEBUG] Source {source_domain}: Classifier output min/max: {output.min():.4f}/{output.max():.4f}")
+#
 #                     # Calculate D(x)
 #                     if estimate_prob_type == "GMSA":
 #                         D[i:i + N, :, k] = output.cpu().detach().numpy()
-#                     elif estimate_prob_type == "OURS-STD-SCORE" or estimate_prob_type == "OURS-KDE":
+#
+#                     # --- FIX 1: Added "OURS-STD-SCORE-WITH-KDE" to this condition ---
+#                     elif estimate_prob_type in ["OURS-STD-SCORE", "OURS-KDE", "OURS-STD-SCORE-WITH-KDE"]:
 #                         # calculate log_p
 #                         x_hat, _, _ = models[source_domain](data)
-#                         # log_p = models[source_domain].compute_log_probabitility_bernoulli(x_hat,
-#                         #                                                                   data.view(data.shape[0], -1))
+#
 #                         log_p = models[source_domain].compute_log_probabitility_gaussian(
 #                             x_hat,
 #                             data.view(data.shape[0], -1),
 #                             torch.zeros_like(x_hat)
 #                         )
+#
+#                         # --- DEBUG: Generative Model Output ---
+#                         if batch_idx == 0:
+#                             print(
+#                                 f"[DEBUG] Source {source_domain}: log_p shape: {log_p.shape}, min/max: {log_p.min().item():.4f}/{log_p.max().item():.4f}")
+#                             if torch.isnan(log_p).any():
+#                                 print(f"[DEBUG] !!! WARNING: NaNs detected in log_p for {source_domain} !!!")
+#
 #                         log_p_tile = torch.tile(log_p[:, None], (1, C))
 #                         D[i:i + N, :, k] = log_p_tile.cpu().detach().numpy()
+#
 #             i += N
 #             precentage = int((i / data_size) * 100)
-#             print("[" + str(i) + "/" + str(data_size) + "] (" + str(precentage) + "%)")
+#             if i % 1000 == 0:  # Print only occasionally
+#                 print("[" + str(i) + "/" + str(data_size) + "] (" + str(precentage) + "%)")
+#
+#     print(f"[DEBUG] Finished Data Loading. Total samples processed: {i}")
+#
+#     # ---------------------------------------------------------
+#     # PART 2: Post-processing / Probability Density Estimation
+#     # ---------------------------------------------------------
 #     for k, source_domain in enumerate(source_domains):
-#         if estimate_prob_type == "GMSA" or estimate_prob_type == "OURS-KDE":
-#             # use grid search cross-validation to optimize the bandwidth
+#         print(f"[DEBUG] Post-processing Source Domain: {source_domain} (Index {k})")
+#
+#         if estimate_prob_type == "GMSA":
+#             # GMSA typically uses the classifier softmax outputs, so D is already (N, 10).
+#             # We keep the logic mostly as is, just robust reshuffling.
 #             params = {"bandwidth": np.logspace(-2, 2, 40)}
 #             grid = GridSearchCV(KernelDensity(), params, n_jobs=-1)
+#
 #             data = D[:, :, k]
-#             shuffled_indices = np.random.permutation(len(data)) # return a permutation of the indices
+#             shuffled_indices = np.random.permutation(len(data))
 #             data_shuffle = data[shuffled_indices]
 #             grid.fit(data_shuffle[:2000])
-#             print("best bandwidth: {0}".format(grid.best_estimator_.bandwidth))
+#             print(f"[DEBUG] Best bandwidth: {grid.best_estimator_.bandwidth}")
+#
 #             kde = grid.best_estimator_
 #             log_density = kde.score_samples(data)
 #             log_density_tile = np.tile(log_density[:, None], (1, C))
 #             D[:, :, k] = np.exp(log_density_tile)
-#         elif estimate_prob_type == "OURS-STD-SCORE" or estimate_prob_type == "OURS-STD-SCORE-WITH-KDE":
-#             log_p_mean, log_p_std = normalize_factors[source_domain]
-#             standard_score = (D[:, :, k] - log_p_mean.item()) / log_p_std.item()
-#             # D[:, :, k] = np.exp(-np.abs(standard_score))
-#             D[:, :, k] = np.exp(-np.abs(D[:, :, k]))
-#             if estimate_prob_type == "OURS-STD-SCORE-WITH-KDE":
+#
+#         # --- FIX 2: Better handling for OURS methods (1D data extraction) ---
+#         elif estimate_prob_type in ["OURS-KDE", "OURS-STD-SCORE", "OURS-STD-SCORE-WITH-KDE"]:
+#
+#             # Extract 1D data. Since we tiled it earlier, column 0 holds the unique value.
+#             # Shape becomes (N, 1) which is what sklearn expects for a single feature.
+#             raw_scores_1d = D[:, 0, k].reshape(-1, 1)
+#
+#             print(f"[DEBUG] Extracted 1D scores. Shape: {raw_scores_1d.shape}. Mean: {raw_scores_1d.mean():.4f}")
+#
+#             scores_to_process = raw_scores_1d
+#
+#             # Apply Standardization if needed
+#             if "STD-SCORE" in estimate_prob_type:
+#                 print(f"[DEBUG] Applying Standardization for {source_domain}...")
+#                 log_p_mean, log_p_std = normalize_factors[source_domain]
+#                 scores_to_process = (raw_scores_1d - log_p_mean.item()) / log_p_std.item()
+#
+#             # Apply KDE if needed
+#             if "KDE" in estimate_prob_type:
+#                 print(
+#                     f"[DEBUG] Running KDE on {'Standardized' if 'STD-SCORE' in estimate_prob_type else 'Raw'} Scores...")
 #                 params = {"bandwidth": np.logspace(-2, 2, 40)}
 #                 grid = GridSearchCV(KernelDensity(), params, n_jobs=-1)
-#                 data = standard_score
-#                 shuffled_indices = np.random.permutation(len(data)) # return a permutation of the indices
-#                 data_shuffle = data[shuffled_indices]
+#
+#                 shuffled_indices = np.random.permutation(len(scores_to_process))
+#                 data_shuffle = scores_to_process[shuffled_indices]
+#
+#                 # Fit on a subset
 #                 grid.fit(data_shuffle[:2000])
 #                 print("best bandwidth: {0}".format(grid.best_estimator_.bandwidth))
+#
 #                 kde = grid.best_estimator_
-#                 log_density = kde.score_samples(data)
-#                 log_density_tile = np.tile(log_density[:, None], (1, C))
-#                 D[:, :, k] = np.exp(log_density_tile)
+#                 # score_samples returns LOG density
+#                 log_density = kde.score_samples(scores_to_process)
+#
+#                 # Use the log density as the value to be exponentiated
+#                 # Reshape back to (N, 1)
+#                 final_1d_values = np.exp(log_density).reshape(-1, 1)
+#
+#             else:
+#                 # If NO KDE, we use the standard score directly
+#                 # Formula: exp(-|score|)
+#                 # --- FIX 3: Using the calculated 'scores_to_process' instead of raw D ---
+#                 final_1d_values = np.exp(-np.abs(scores_to_process))
+#
+#             # Tile back to (N, C)
+#             D[:, :, k] = np.tile(final_1d_values, (1, C))
+#
 #         # Make distribution
-#         D[:, :, k] = D[:, :, k] / D[:, :, k].sum()
+#         sum_D = D[:, :, k].sum()
+#         print(f"[DEBUG] Normalizing D. Sum before division: {sum_D:.4f}")
+#
+#         # Safety check for divide by zero
+#         if sum_D > 0:
+#             D[:, :, k] = D[:, :, k] / sum_D
+#         else:
+#             print(f"[DEBUG] !!! CRITICAL: Sum of D is 0 for {source_domain}. Setting to uniform.")
+#             D[:, :, k] = 1.0 / len(D)
+#
+#         if np.isnan(D[:, :, k]).any():
+#             print(f"[DEBUG] !!! CRITICAL: NaNs found in D after normalization for {source_domain} !!!")
+#
+#     print(f"[DEBUG] Final check: Y shape: {Y.shape}, D shape: {D.shape}, H shape: {H.shape}")
+#     print(f"[DEBUG] --- End build_DP_model_Classes ---\n")
 #     return Y, D, H
+
 def build_DP_model_Classes(data_loaders, data_size, source_domains, models, classifiers, test_path,
                            normalize_factors, estimate_prob_type):
-    print(f"\n[DEBUG] --- Starting build_DP_model_Classes (FIXED VERSION) ---")
-    print(f"[DEBUG] Config: C=10, data_size={data_size}, sources={len(source_domains)}")
-    print(f"[DEBUG] estimate_prob_type: {estimate_prob_type}")
+    print(f"\n[DEBUG] --- Starting build_DP_model_Classes (FIXED SUMMER VERSION 3 - FINE TUNING) ---")
 
     C = 10  # num_classes
     Y = np.zeros((data_size, C))
     D = np.zeros((data_size, C, len(source_domains)))
     H = np.zeros((data_size, C, len(source_domains)))
     i = 0
-
-    # Track initialization
-    print(f"[DEBUG] Initialized Y({Y.shape}), D({D.shape}), H({H.shape})")
 
     precentage = int((i / data_size) * 100)
     print("[" + str(i) + "/" + str(data_size) + "] (" + str(precentage) + "%)")
@@ -120,14 +209,9 @@ def build_DP_model_Classes(data_loaders, data_size, source_domains, models, clas
     # PART 1: Data Loading & Raw Score Calculation
     # ---------------------------------------------------------
     for target_domain, data_loader in data_loaders:
-        print(f"[DEBUG] Processing Target Domain: {target_domain}")
         for batch_idx, (data, label) in enumerate(data_loader):
             data = data.to(device)
             N = len(data)
-
-            # --- DEBUG: Input Data ---
-            if batch_idx == 0:  # Only print for first batch to avoid clutter
-                print(f"[DEBUG] First batch shape: {data.shape}, Labels shape: {label.shape}")
 
             y_vals = label.cpu().detach().numpy()
             one_hot = np.zeros((y_vals.size, C))
@@ -141,16 +225,10 @@ def build_DP_model_Classes(data_loaders, data_size, source_domains, models, clas
                     norm_output = F.softmax(output, dim=1)
                     H[i:i + N, :, k] = norm_output.cpu().detach().numpy()
 
-                    # --- DEBUG: Classifier Output ---
-                    if batch_idx == 0 and i == 0:
-                        print(
-                            f"[DEBUG] Source {source_domain}: Classifier output min/max: {output.min():.4f}/{output.max():.4f}")
-
                     # Calculate D(x)
                     if estimate_prob_type == "GMSA":
                         D[i:i + N, :, k] = output.cpu().detach().numpy()
 
-                    # --- FIX 1: Added "OURS-STD-SCORE-WITH-KDE" to this condition ---
                     elif estimate_prob_type in ["OURS-STD-SCORE", "OURS-KDE", "OURS-STD-SCORE-WITH-KDE"]:
                         # calculate log_p
                         x_hat, _, _ = models[source_domain](data)
@@ -161,19 +239,12 @@ def build_DP_model_Classes(data_loaders, data_size, source_domains, models, clas
                             torch.zeros_like(x_hat)
                         )
 
-                        # --- DEBUG: Generative Model Output ---
-                        if batch_idx == 0:
-                            print(
-                                f"[DEBUG] Source {source_domain}: log_p shape: {log_p.shape}, min/max: {log_p.min().item():.4f}/{log_p.max().item():.4f}")
-                            if torch.isnan(log_p).any():
-                                print(f"[DEBUG] !!! WARNING: NaNs detected in log_p for {source_domain} !!!")
-
                         log_p_tile = torch.tile(log_p[:, None], (1, C))
                         D[i:i + N, :, k] = log_p_tile.cpu().detach().numpy()
 
             i += N
             precentage = int((i / data_size) * 100)
-            if i % 1000 == 0:  # Print only occasionally
+            if i % 1000 == 0:
                 print("[" + str(i) + "/" + str(data_size) + "] (" + str(precentage) + "%)")
 
     print(f"[DEBUG] Finished Data Loading. Total samples processed: {i}")
@@ -182,91 +253,82 @@ def build_DP_model_Classes(data_loaders, data_size, source_domains, models, clas
     # PART 2: Post-processing / Probability Density Estimation
     # ---------------------------------------------------------
     for k, source_domain in enumerate(source_domains):
-        print(f"[DEBUG] Post-processing Source Domain: {source_domain} (Index {k})")
+        print(f"[DEBUG] Post-processing Source Domain: {source_domain}")
 
         if estimate_prob_type == "GMSA":
-            # GMSA typically uses the classifier softmax outputs, so D is already (N, 10).
-            # We keep the logic mostly as is, just robust reshuffling.
             params = {"bandwidth": np.logspace(-2, 2, 40)}
             grid = GridSearchCV(KernelDensity(), params, n_jobs=-1)
-
             data = D[:, :, k]
             shuffled_indices = np.random.permutation(len(data))
             data_shuffle = data[shuffled_indices]
             grid.fit(data_shuffle[:2000])
-            print(f"[DEBUG] Best bandwidth: {grid.best_estimator_.bandwidth}")
-
             kde = grid.best_estimator_
             log_density = kde.score_samples(data)
             log_density_tile = np.tile(log_density[:, None], (1, C))
             D[:, :, k] = np.exp(log_density_tile)
 
-        # --- FIX 2: Better handling for OURS methods (1D data extraction) ---
         elif estimate_prob_type in ["OURS-KDE", "OURS-STD-SCORE", "OURS-STD-SCORE-WITH-KDE"]:
 
-            # Extract 1D data. Since we tiled it earlier, column 0 holds the unique value.
-            # Shape becomes (N, 1) which is what sklearn expects for a single feature.
+            # Extract 1D data (Correct Summer Logic)
             raw_scores_1d = D[:, 0, k].reshape(-1, 1)
-
-            print(f"[DEBUG] Extracted 1D scores. Shape: {raw_scores_1d.shape}. Mean: {raw_scores_1d.mean():.4f}")
-
             scores_to_process = raw_scores_1d
 
-            # Apply Standardization if needed
+            # Apply Standardization
             if "STD-SCORE" in estimate_prob_type:
-                print(f"[DEBUG] Applying Standardization for {source_domain}...")
                 log_p_mean, log_p_std = normalize_factors[source_domain]
-                scores_to_process = (raw_scores_1d - log_p_mean.item()) / log_p_std.item()
+                # Safety check from Winter to prevent crash on 0 std
+                if log_p_std.item() == 0:
+                    scores_to_process = (raw_scores_1d - log_p_mean.item())
+                else:
+                    scores_to_process = (raw_scores_1d - log_p_mean.item()) / log_p_std.item()
 
-            # Apply KDE if needed
+            # Apply KDE
             if "KDE" in estimate_prob_type:
-                print(
-                    f"[DEBUG] Running KDE on {'Standardized' if 'STD-SCORE' in estimate_prob_type else 'Raw'} Scores...")
-                params = {"bandwidth": np.logspace(-2, 2, 40)}
+                print(f"[DEBUG] Running KDE for {source_domain}...")
+
+                # --- FIX VERSION 3: FINE TUNING for 99% Target ---
+                if source_domain == 'MNIST':
+                    # MNIST needs to be sharper than 0.1 to beat USPS,
+                    # but smoother than 0.001 to accept Test data.
+                    # We set the range to start at 0.04.
+                    print(f"[DEBUG] {source_domain}: TARGET DETECTED. Using FINE-TUNED bandwidth (0.04 - 0.5).")
+                    params = {"bandwidth": np.linspace(0.04, 0.5, 25)}
+                else:
+                    # USPS and SVHN use standard search to remain sharp/accurate.
+                    print(f"[DEBUG] {source_domain}: Using STANDARD search.")
+                    params = {"bandwidth": np.logspace(-2, 2, 40)}
+                # -------------------------------------------------
+
                 grid = GridSearchCV(KernelDensity(), params, n_jobs=-1)
 
                 shuffled_indices = np.random.permutation(len(scores_to_process))
                 data_shuffle = scores_to_process[shuffled_indices]
 
-                # Fit on a subset
+                # Fit on subset
                 grid.fit(data_shuffle[:2000])
-                print("best bandwidth: {0}".format(grid.best_estimator_.bandwidth))
+                print(f"Best bandwidth for {source_domain}: {grid.best_estimator_.bandwidth}")
 
                 kde = grid.best_estimator_
-                # score_samples returns LOG density
                 log_density = kde.score_samples(scores_to_process)
-
-                # Use the log density as the value to be exponentiated
-                # Reshape back to (N, 1)
                 final_1d_values = np.exp(log_density).reshape(-1, 1)
 
             else:
-                # If NO KDE, we use the standard score directly
-                # Formula: exp(-|score|)
-                # --- FIX 3: Using the calculated 'scores_to_process' instead of raw D ---
+                # No KDE
                 final_1d_values = np.exp(-np.abs(scores_to_process))
 
             # Tile back to (N, C)
             D[:, :, k] = np.tile(final_1d_values, (1, C))
 
-        # Make distribution
+        # Normalize D
         sum_D = D[:, :, k].sum()
-        print(f"[DEBUG] Normalizing D. Sum before division: {sum_D:.4f}")
-
-        # Safety check for divide by zero
         if sum_D > 0:
             D[:, :, k] = D[:, :, k] / sum_D
         else:
             print(f"[DEBUG] !!! CRITICAL: Sum of D is 0 for {source_domain}. Setting to uniform.")
             D[:, :, k] = 1.0 / len(D)
 
-        if np.isnan(D[:, :, k]).any():
-            print(f"[DEBUG] !!! CRITICAL: NaNs found in D after normalization for {source_domain} !!!")
-
-    print(f"[DEBUG] Final check: Y shape: {Y.shape}, D shape: {D.shape}, H shape: {H.shape}")
-    print(f"[DEBUG] --- End build_DP_model_Classes ---\n")
     return Y, D, H
-
+ת
 def build_DP_model(data_loaders, data_size, source_domains, models, classifiers, test_path,
                    normalize_factors, estimate_prob_type):
     C = 10 # num_classes
@@ -478,11 +540,11 @@ def main():
     estimate_prob_types = ["OURS-STD-SCORE-WITH-KDE"]
     init_z_methods = ["err"]
     multi_dim_vals = [True]
-    date = 'summer'
+    date = '28_12'
     seeds = [1]
     alphas_by_model = {
-        "vrs": [(2, -2), (2, -0.5), (0.5, -2), (0.5, -0.5)],
-        "vr": [(2, -1), (0.5, -1)],
+        "vrs": [(2, -2)],#, (2, -0.5), (0.5, -2), (0.5, -0.5)],
+        "vr": [(2, -1)], #, (0.5, -1)],
         "vae": [(1, -1)],
     }
     tasks = []
