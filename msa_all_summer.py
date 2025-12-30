@@ -37,11 +37,17 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 torch.set_num_threads(1)
 
 # --- GLOBAL CONFIG FOR ERRORS (EPSILONS) ---
-# Based on Source Classifier Accuracy on Source Test Set
 SOURCE_ERRORS = {
     'MNIST': 1.0 - 0.9948,
     'USPS': 1.0 - 0.972596,
     'SVHN': 1.0 - 0.949716
+}
+
+# --- TRUE TEST SET SIZES (For Oracle Calculation) ---
+TEST_SET_SIZES = {
+    'MNIST': 10000,
+    'USPS': 2007,
+    'SVHN': 26032
 }
 
 
@@ -53,13 +59,34 @@ def log_print(*args, **kwargs):
     sys.stdout.flush()
 
 
+def get_oracle_weights(target_domains, source_domains):
+    """
+    Calculates the TRUE ratio of the source domains within the current target mix.
+    If a source domain is NOT in the target mix, its weight is 0.
+    """
+    weights = []
+    total_samples = 0
+
+    # Calculate total relevant samples
+    for domain in target_domains:
+        if domain in TEST_SET_SIZES:
+            total_samples += TEST_SET_SIZES[domain]
+
+    # Calculate weight for each source domain
+    for source in source_domains:
+        if source in target_domains:
+            w = TEST_SET_SIZES[source] / total_samples
+        else:
+            w = 0.0
+        weights.append(w)
+
+    return np.array(weights)
+
+
 def build_DP_model_Classes(data_loaders, data_size, source_domains, models, classifiers, test_path,
                            normalize_factors, estimate_prob_type):
     """
     VERSION 5: Target-Optimized Matrix Construction
-    - Auto-detects low variance (Needle effect).
-    - Forces fine-tuned bandwidth (0.04 - 0.5) for sharp datasets.
-    - Applies STRICT Noise Gate (20%) to ensure distinct weights.
     """
     log_print(f"--- Starting build_DP_model_Classes (VERSION 5 - TARGET OPTIMIZED) ---")
 
@@ -158,9 +185,10 @@ def build_DP_model_Classes(data_loaders, data_size, source_domains, models, clas
     # ---------------------------------------------------------
     # PART 3: Strict Global Noise Gate (20%)
     # ---------------------------------------------------------
+    noise_gate = 0.3
     log_print("Applying STRICT Noise Gate (20% Threshold)...")
     max_probs = D.max(axis=2, keepdims=True)
-    mask_weak = D < (max_probs * 0.20)  # Kill if less than 20% of winner
+    mask_weak = D < (max_probs * noise_gate)  # Kill if less than 20% of winner
     D[mask_weak] = 0.0
 
     # ---------------------------------------------------------
@@ -176,11 +204,12 @@ def build_DP_model_Classes(data_loaders, data_size, source_domains, models, clas
     return Y, D, H
 
 
-def solve_and_evaluate(Y, D, H, source_domains, seed, init_z_method, multi_dim, fp, target_name):
+def solve_and_evaluate(Y, D, H, source_domains, seed, init_z_method, multi_dim, fp, target_name_str,
+                       target_domains_list):
     """
-    Runs all 3 solvers using SUBSAMPLING optimization with RELAXATION LOOP.
+    Runs all 3 solvers + ORACLE using SUBSAMPLING optimization with RELAXATION LOOP.
     """
-    solvers = ["DC", "CVXPY_GLOBAL", "CVXPY_PER_DOMAIN"]
+    solvers = ["ORACLE", "DC", "CVXPY_GLOBAL", "CVXPY_PER_DOMAIN"]
 
     # --- CONFIG ---
     SUBSET_SIZE = 2000
@@ -199,56 +228,58 @@ def solve_and_evaluate(Y, D, H, source_domains, seed, init_z_method, multi_dim, 
     H_opt = H[opt_indices]
 
     # --- Prepare Constraints ---
-    # Relaxed Epsilon: Add small buffer (+0.01) to be robust
     errors_list = [SOURCE_ERRORS[d] + 0.01 for d in source_domains]
     eps_global = max(errors_list)
     eps_vector = np.array(errors_list)
 
     results = {}
 
+    # Pre-calculate Oracle Weights once
+    oracle_z = get_oracle_weights(target_domains_list, source_domains)
+
     for solver_name in solvers:
-        log_print(f">>> Running Solver: {solver_name} (on {len(opt_indices)} samples) for Target: {target_name}")
+        log_print(f">>> Running Solver: {solver_name} (on {len(opt_indices)} samples) for Target: {target_name_str}")
         learned_z = None
 
-        # --- RELAXATION LOOP ---
-        # Try stricter delta first, if it fails (infeasible), relax it.
-        deltas_to_try = [0.01, 0.05, 0.1, 0.2]
+        if solver_name == "ORACLE":
+            learned_z = oracle_z
+        else:
+            # --- RELAXATION LOOP ---
+            deltas_to_try = [0.01, 0.05, 0.1, 0.2]
 
-        for delta_val in deltas_to_try:
-            try:
-                delta_vector = np.array([delta_val] * len(source_domains))
+            for delta_val in deltas_to_try:
+                try:
+                    delta_vector = np.array([delta_val] * len(source_domains))
 
-                # --- STEP A: OPTIMIZE Z on SUBSET ---
-                if solver_name == "DC":
-                    # DC doesn't use explicit delta in this implementation
-                    DP = init_problem_from_model(Y_opt, D_opt, H_opt, p=len(source_domains), C=10)
-                    prob = ConvexConcaveProblem(DP)
-                    solver = ConvexConcaveSolver(prob, seed, init_z_method)
-                    learned_z, _, _ = solver.solve()
-                    break  # Success
+                    # --- STEP A: OPTIMIZE Z on SUBSET ---
+                    if solver_name == "DC":
+                        # DC doesn't use explicit delta in this implementation
+                        DP = init_problem_from_model(Y_opt, D_opt, H_opt, p=len(source_domains), C=10)
+                        prob = ConvexConcaveProblem(DP)
+                        solver = ConvexConcaveSolver(prob, seed, init_z_method)
+                        learned_z, _, _ = solver.solve()
+                        break  # Success
 
-                elif solver_name == "CVXPY_GLOBAL":
-                    learned_z = solve_convex_problem_mosek(
-                        Y_opt, D_opt, H_opt, delta=delta_val, epsilon=eps_global, solver_type='SCS'
-                    )
-                    if learned_z is not None: break
+                    elif solver_name == "CVXPY_GLOBAL":
+                        learned_z = solve_convex_problem_mosek(
+                            Y_opt, D_opt, H_opt, delta=delta_val, epsilon=eps_global, solver_type='SCS'
+                        )
+                        if learned_z is not None: break
 
-                elif solver_name == "CVXPY_PER_DOMAIN":
-                    learned_z = solve_convex_problem_per_domain(
-                        Y_opt, D_opt, H_opt, delta=delta_vector, epsilon=eps_vector, solver_type='SCS'
-                    )
-                    if learned_z is not None: break
+                    elif solver_name == "CVXPY_PER_DOMAIN":
+                        learned_z = solve_convex_problem_per_domain(
+                            Y_opt, D_opt, H_opt, delta=delta_vector, epsilon=eps_vector, solver_type='SCS'
+                        )
+                        if learned_z is not None: break
 
-            except Exception as e:
-                # log_print(f"   [Retry] Delta={delta_val} failed for {solver_name}: {e}")
-                continue
+                except Exception as e:
+                    continue
 
-        if learned_z is None:
-            log_print(f"   [WARNING] All deltas failed for {solver_name}. Using Uniform.")
-            learned_z = np.ones(len(source_domains)) / len(source_domains)
+            if learned_z is None:
+                log_print(f"   [WARNING] All deltas failed for {solver_name}. Using Uniform.")
+                learned_z = np.ones(len(source_domains)) / len(source_domains)
 
         # --- STEP B: EVALUATE on FULL DATASET ---
-        # Calculate Weighted combination
         z_tensor = learned_z.reshape(1, 1, -1)
         weighted_preds = (D * H) * z_tensor
         final_probs = weighted_preds.sum(axis=2)
@@ -262,18 +293,20 @@ def solve_and_evaluate(Y, D, H, source_domains, seed, init_z_method, multi_dim, 
 
         score = accuracy_score(y_true=Y_true, y_pred=hz_pred)
 
-        log_print(f"   [Target: {target_name}] Weights ({solver_name}): {learned_z}")
-        log_print(f"   [Target: {target_name}] Score ({solver_name}): {score * 100:.2f}%")
+        # Calculate L1 Distance from Oracle
+        l1_dist = np.sum(np.abs(learned_z - oracle_z))
 
-        # Log to file
-        fp.write(f"Target: {target_name} | Solver: {solver_name}\n")
-        fp.write(f"Weights: {learned_z}\n")
-        fp.write(f"Score: {score * 100}\n\n")
-        fp.flush()  # Ensure write to disk
+        log_print(f"   [Target: {target_name_str}] Weights ({solver_name}): {learned_z}")
+        log_print(f"   [Target: {target_name_str}] Score ({solver_name}): {score * 100:.2f}% | L1 Dist: {l1_dist:.4f}")
 
-        results[solver_name] = score
+        # Store for summary table
+        results[solver_name] = {
+            "weights": learned_z,
+            "score": score * 100,
+            "l1_dist": l1_dist
+        }
 
-    return results
+    return results, oracle_z
 
 
 def run_domain_adaptation(alpha_pos, alpha_neg, vr_model_type, seed, test_path,
@@ -326,9 +359,12 @@ def run_domain_adaptation(alpha_pos, alpha_neg, vr_model_type, seed, test_path,
             log_print(f"Factors {domain}: {normalize_factors[domain]}")
 
     # --- MAIN TARGET LOOP ---
+    all_summary_data = []
+
     with open(test_path + r'/Results_ALL_SOLVERS_{}.txt'.format(seed), 'w') as fp:
         for target_domains in target_domains_sets:
-            log_print(f"\n=== Processing Target Mix: {target_domains} ===")
+            target_str = str(target_domains)
+            log_print(f"\n=== Processing Target Mix: {target_str} ===")
 
             target_data_size = 0
             target_data_loaders = []
@@ -343,8 +379,33 @@ def run_domain_adaptation(alpha_pos, alpha_neg, vr_model_type, seed, test_path,
                 normalize_factors, estimate_prob_type
             )
 
-            solve_and_evaluate(Y_tgt, D_tgt, H_tgt, source_domains, seed,
-                               init_z_method, multi_dim, fp, str(target_domains))
+            # Solve & Evaluate
+            iter_results, oracle_z = solve_and_evaluate(Y_tgt, D_tgt, H_tgt, source_domains, seed,
+                                                        init_z_method, multi_dim, fp, target_str, target_domains)
+
+            # Write detailed logs
+            for solver, res in iter_results.items():
+                fp.write(f"Target: {target_str} | Solver: {solver}\n")
+                fp.write(f"Weights: {res['weights']}\n")
+                fp.write(f"Score: {res['score']:.2f}\n")
+                fp.write(f"L1 Dist from Oracle: {res['l1_dist']:.4f}\n\n")
+
+                # Collect for summary table
+                all_summary_data.append({
+                    "Target Mix": target_str,
+                    "True Ratio (Oracle)": np.round(oracle_z, 2),
+                    "Solver": solver,
+                    "Learned Weights": np.round(res['weights'], 2),
+                    "Score (%)": round(res['score'], 2),
+                    "L1 Dist": round(res['l1_dist'], 4)
+                })
+
+        # Write Summary Table
+        fp.write("\n\n" + "=" * 50 + "\nSUMMARY TABLE\n" + "=" * 50 + "\n")
+        df_summary = pd.DataFrame(all_summary_data)
+        fp.write(df_summary.to_string())
+        log_print("\nSUMMARY TABLE:\n")
+        log_print(df_summary.to_string())
 
 
 def task_run(date, seed, estimate_prob_type, init_z_method, multi_dim,
@@ -384,7 +445,7 @@ def main():
     estimate_prob_types = ["OURS-STD-SCORE-WITH-KDE"]
     init_z_methods = ["err"]
     multi_dim_vals = [True]
-    date = 'summer_v5_all_solvers'
+    date = '29_12_v5_all_solvers_with_oracle'
     seeds = [1]
 
     alphas_by_model = {
