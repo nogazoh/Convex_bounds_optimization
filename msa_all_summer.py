@@ -66,6 +66,9 @@ def map_weights_to_full_source_list(subset_weights, subset_sources, full_source_
     Example: subset_weights=[0.8, 0.2], subset_sources=['M', 'U'], full=['M', 'U', 'S']
     Result -> [0.8, 0.2, 0.0]
     """
+    if subset_weights is None:
+        return None
+
     full_weights = np.zeros(len(full_source_list))
     for i, source in enumerate(full_source_list):
         if source in subset_sources:
@@ -245,17 +248,19 @@ def build_DP_model_Classes(data_loaders, data_size, source_domains, models, clas
     return Y, D, H
 
 
-def solve_and_evaluate(Y_train, D_train, H_train, Y_test, D_test, H_test,
-                       source_domains, seed, init_z_method, multi_dim, fp,
-                       target_name_str, target_domains_list,
-                       precomputed_weights=None, oracle_mode="real_ratio"):
+def solve_and_evaluate_sweep(Y_train, D_train, H_train, Y_test, D_test, H_test,
+                             source_domains, seed, init_z_method, multi_dim, fp,
+                             target_name_str, target_domains_list,
+                             precomputed_weights=None, oracle_mode="real_ratio"):
     """
-    Runs solvers + ORACLE + UNIFORM Baseline.
-    Detects 'Fake Success' (Fallback) only if weights are IDENTICAL to uniform.
+    Runs Solvers with Hyperparameter Sweep on Delta.
+    Delta = Multiplier * ln(K)
+    Reports ALL results per multiplier.
+    Handles 'Infeasible/Fallback' by marking them explicitly.
     """
     solvers = ["ORACLE", "UNIFORM", "DC", "CVXPY_GLOBAL", "CVXPY_PER_DOMAIN"]
 
-    # --- OPTIMIZATION SUBSET (From Train Data) ---
+    # --- OPTIMIZATION SUBSET ---
     SUBSET_SIZE = 2000
     N_train = len(Y_train)
     if N_train > SUBSET_SIZE:
@@ -268,112 +273,166 @@ def solve_and_evaluate(Y_train, D_train, H_train, Y_test, D_test, H_test,
     D_opt = D_train[opt_indices]
     H_opt = H_train[opt_indices]
 
-    # --- Prepare Constraints ---
+    # --- Prepare Constants ---
     errors_list = [SOURCE_ERRORS[d] + 0.01 for d in source_domains]
     eps_global = max(errors_list)
     eps_vector = np.array(errors_list)
 
-    results = {}
-
-    # Pre-calculate Oracle Weights
+    # Oracle & Uniform
     oracle_z_test = get_oracle_weights(target_domains_list, source_domains, mode=oracle_mode)
-
-    # Pre-calculate Uniform Weights
     uniform_weights = np.ones(len(source_domains)) / len(source_domains)
 
+    # Calculate Max Entropy (Base for Delta)
+    K = len(source_domains)
+    max_entropy = np.log(K) if K > 1 else 0.0
+
+    # Multipliers for Sweep
+    # If K=1, this loop is meaningless, but handled.
+    multipliers = [0.5, 0.8, 1.0, 1.3, 1.5, 2.0]
+
+    # Structure: results[solver] = [ {multiplier, delta, weights, score, status}, ... ]
+    results = {}
+
     for solver_name in solvers:
-        learned_z = None
-        solver_status = "Unknown"
+        results[solver_name] = []
 
-        if solver_name == "ORACLE":
-            learned_z = oracle_z_test
-            solver_status = "Oracle (Target Truth)"
+        # --- FIXED SOLVERS (Run Once) ---
+        if solver_name in ["ORACLE", "UNIFORM"] or (precomputed_weights and solver_name in precomputed_weights):
 
-        elif solver_name == "UNIFORM":
-            learned_z = uniform_weights
-            solver_status = "Fixed (1/N)"
+            if solver_name == "ORACLE":
+                w = oracle_z_test
+                st = "Oracle"
+            elif solver_name == "UNIFORM":
+                w = uniform_weights
+                st = "Fixed"
+            else:
+                w = precomputed_weights[solver_name]
+                st = "Precomputed"
 
-        elif precomputed_weights is not None and solver_name in precomputed_weights:
-            # STATIC MODE
-            learned_z = precomputed_weights[solver_name]
-            solver_status = "Static (Precomputed)"
+            # Eval
+            z_tensor = w.reshape(1, 1, -1)
+            weighted_preds = (D_test * H_test) * z_tensor
+            final_probs = weighted_preds.sum(axis=2)
+            if multi_dim:
+                hz_pred = final_probs.argmax(axis=1)
+                Y_true = Y_test.argmax(axis=1)
+            else:
+                hz_pred = final_probs.argmax(axis=1)
+                Y_true = Y_test
 
-        else:
-            # DYNAMIC OPTIMIZATION MODE
-            log_print(f">>> Running Optimization: {solver_name}")
+            sc = accuracy_score(Y_true, hz_pred)
+            l1 = np.sum(np.abs(w - oracle_z_test))
 
-            # Try deltas until one works
-            deltas_to_try = [1.0, 2, 3]
+            # Store single result (multiplier=None)
+            results[solver_name].append({
+                "multiplier": "N/A",
+                "delta": "N/A",
+                "weights": w,
+                "score": sc * 100,
+                "l1_dist": l1,
+                "status": st
+            })
+            continue
 
-            for delta_val in deltas_to_try:
-                try:
-                    delta_vector = np.array([delta_val] * len(source_domains))
+        # --- DYNAMIC SOLVERS (Run Sweep) ---
+        log_print(f">>> Running Sweep for: {solver_name}")
 
-                    if solver_name == "DC":
-                        DP = init_problem_from_model(Y_opt, D_opt, H_opt, p=len(source_domains), C=10)
-                        prob = ConvexConcaveProblem(DP)
-                        solver = ConvexConcaveSolver(prob, seed, init_z_method)
-                        learned_z, _, _ = solver.solve()
-                        if learned_z is not None:
-                            solver_status = f"Converged (DC)"
-                            break
+        for mult in multipliers:
+            delta_val = mult * max_entropy
 
-                    elif solver_name == "CVXPY_GLOBAL":
-                        learned_z = solve_convex_problem_mosek(
-                            Y_opt, D_opt, H_opt, delta=delta_val, epsilon=eps_global, solver_type='SCS'
-                        )
+            # Special case for 1 domain
+            if K == 1:
+                delta_val = 0.0
 
-                    elif solver_name == "CVXPY_PER_DOMAIN":
-                        learned_z = solve_convex_problem_per_domain(
-                            Y_opt, D_opt, H_opt, delta=delta_vector, epsilon=eps_vector, solver_type='SCS'
-                        )
+            learned_z = None
+            status = "Unknown"
 
-                    # --- CHECK FOR FALLBACK ---
-                    if learned_z is not None:
-                        # FIX: Using 1e-9 to ensure we only catch the exact fallback,
-                        # while allowing valid optimization results that are close to uniform.
-                        is_exact_uniform = np.allclose(learned_z, uniform_weights, atol=1e-9)
+            try:
+                delta_vector = np.array([delta_val] * K)
 
-                        # If it is EXACTLY uniform (and delta isn't huge), assume it's the fallback
-                        if is_exact_uniform:
-                            learned_z = None  # Treat as failure
-                            continue  # Try next delta
-                        else:
-                            solver_status = f"Converged (d={delta_val})"
-                            break
+                if solver_name == "DC":
+                    # DC doesn't use delta exactly like this, but we keep the interface
+                    # Or we just run DC once? Let's run it once per loop or assume fixed params.
+                    # Usually DC doesn't have the Delta constraint in this specific implementation.
+                    # We will run it, but it might not be sensitive to delta in this code.
+                    DP = init_problem_from_model(Y_opt, D_opt, H_opt, p=K, C=10)
+                    prob = ConvexConcaveProblem(DP)
+                    solver = ConvexConcaveSolver(prob, seed, init_z_method)
+                    learned_z, _, _ = solver.solve()
+                    status = "Converged"
 
-                except Exception as e:
-                    continue
+                elif solver_name == "CVXPY_GLOBAL":
+                    learned_z = solve_convex_problem_mosek(
+                        Y_opt, D_opt, H_opt, delta=delta_val, epsilon=eps_global, solver_type='SCS'
+                    )
 
+                elif solver_name == "CVXPY_PER_DOMAIN":
+                    learned_z = solve_convex_problem_per_domain(
+                        Y_opt, D_opt, H_opt, delta=delta_vector, epsilon=eps_vector, solver_type='SCS'
+                    )
+
+            except Exception as e:
+                learned_z = None
+                status = "Error"
+
+            # --- CHECK VALIDITY ---
+            is_valid = True
             if learned_z is None:
-                log_print(f"   [WARNING] All deltas failed for {solver_name}. Using Uniform.")
-                learned_z = uniform_weights
-                solver_status = "FAILED (Fallback)"
+                is_valid = False
+                status = "Infeasible (None)"
+            else:
+                # Check for Uniform Fallback
+                is_exact_uniform = np.allclose(learned_z, uniform_weights, atol=1e-9)
+                if is_exact_uniform:
+                    # If K=1, uniform is the ONLY solution, so it's valid.
+                    # If K>1, it's a fallback failure.
+                    if K > 1:
+                        is_valid = False
+                        status = "Infeasible (Fallback)"
+                        learned_z = None
+                    else:
+                        status = "Converged (Single Source)"
 
-        # --- EVALUATION (On Test Data) ---
-        z_tensor = learned_z.reshape(1, 1, -1)
-        weighted_preds = (D_test * H_test) * z_tensor
-        final_probs = weighted_preds.sum(axis=2)
+            # --- EVALUATION (If Valid) ---
+            if is_valid:
+                z_tensor = learned_z.reshape(1, 1, -1)
+                weighted_preds = (D_test * H_test) * z_tensor
+                final_probs = weighted_preds.sum(axis=2)
+                if multi_dim:
+                    hz_pred = final_probs.argmax(axis=1)
+                    Y_true = Y_test.argmax(axis=1)
+                else:
+                    hz_pred = final_probs.argmax(axis=1)
+                    Y_true = Y_test
 
-        if multi_dim:
-            Y_true = Y_test.argmax(axis=1)
-            hz_pred = final_probs.argmax(axis=1)
-        else:
-            Y_true = Y_test
-            hz_pred = final_probs.argmax(axis=1)
+                score = accuracy_score(Y_true, hz_pred)
+                l1_dist = np.sum(np.abs(learned_z - oracle_z_test))
+                status = "Converged"
+            else:
+                score = 0.0
+                l1_dist = 0.0
+                # Keep learned_z as None
 
-        score = accuracy_score(y_true=Y_true, y_pred=hz_pred)
-        l1_dist = np.sum(np.abs(learned_z - oracle_z_test))
+            # Record
+            results[solver_name].append({
+                "multiplier": mult,
+                "delta": delta_val,
+                "weights": learned_z,
+                "score": score * 100 if is_valid else None,
+                "l1_dist": l1_dist if is_valid else None,
+                "status": status
+            })
 
-        log_print(f"   [Target: {target_name_str}] Solver: {solver_name} | Status: {solver_status}")
-        log_print(f"   Weights: {learned_z} | Score: {score * 100:.2f}%")
+            # Print row
+            if is_valid:
+                log_print(f"   [Mult: {mult} | Delta: {delta_val:.3f}] Score: {score * 100:.2f}% | w: {learned_z}")
+            else:
+                log_print(f"   [Mult: {mult} | Delta: {delta_val:.3f}] Status: {status}")
 
-        results[solver_name] = {
-            "weights": learned_z,
-            "score": score * 100,
-            "l1_dist": l1_dist,
-            "status": solver_status
-        }
+            # For DC, it usually yields same result regardless of delta in this wrapper,
+            # so we might break early to save time if needed. But consistent sweep is fine.
+            if solver_name == "DC":
+                break  # DC implementation here doesn't use the delta loop, so run once.
 
     return results, oracle_z_test
 
@@ -386,14 +445,12 @@ def run_domain_adaptation(alpha_pos, alpha_neg, vr_model_type, seed, test_path,
     torch.manual_seed(seed)
     np.random.seed(seed=seed)
 
-    # --- STRING HELPERS FOR FILENAMES ---
     source_mode_str = "Sources_RESTRICTED" if restrict_sources_to_target else "Sources_ALL"
 
     target_domains_sets = [
         ['MNIST', 'USPS', 'SVHN'],
-        ['MNIST', 'USPS'], ['MNIST', 'SVHN'], ['USPS', 'SVHN']
-        # ,
-        # ['MNIST'], ['USPS'], ['SVHN']
+        ['MNIST', 'USPS'], ['MNIST', 'SVHN'], ['USPS', 'SVHN'],
+        ['MNIST'], ['USPS'], ['SVHN']
     ]
 
     models = {}
@@ -431,9 +488,8 @@ def run_domain_adaptation(alpha_pos, alpha_neg, vr_model_type, seed, test_path,
             normalize_factors[domain] = (all_probs.mean(), all_probs.std())
             log_print(f"Factors {domain}: {normalize_factors[domain]}")
 
-    # --- GLOBAL OPTIMIZATION (If selected) ---
-    global_weights = None
-    all_summary_data = []
+    # --- GLOBAL OPTIMIZATION ---
+    global_weights_map = {}  # Store weights per solver
 
     if optimization_scope == "global":
         log_print(f"\n=== MODE: GLOBAL OPTIMIZATION (Sampling: {sampling_strategy}) ===")
@@ -444,39 +500,42 @@ def run_domain_adaptation(alpha_pos, alpha_neg, vr_model_type, seed, test_path,
             normalize_factors, estimate_prob_type
         )
 
-        global_results, global_oracle = solve_and_evaluate(
+        # In global mode we just run one 'best guess' or sweep?
+        # For simplicity, let's run sweep but we only keep the best/last for 'static' use?
+        # Actually, global usually implies one set of weights.
+        # We will pick the weights from multiplier=1.0 (or last feasible) for the Static dictionary.
+
+        global_results, _ = solve_and_evaluate_sweep(
             Y_train, D_train, H_train, Y_train, D_train, H_train,
             all_source_domains, seed, init_z_method, multi_dim, open(os.devnull, 'w'),
             "GLOBAL_TRAIN", all_source_domains, oracle_mode="balanced"
         )
 
-        global_weights = {k: v['weights'] for k, v in global_results.items() if k != "ORACLE"}
-        log_print(f"Global Weights Learned: {global_weights}")
+        # Extract representative weights for Static Mode (e.g. from Multiplier 1.0)
+        for solver, res_list in global_results.items():
+            best_w = None
+            for r in res_list:
+                if r['weights'] is not None:
+                    best_w = r['weights']
+                    if r['multiplier'] == 1.0:  # Prefer multiplier 1.0
+                        break
+            if best_w is not None:
+                global_weights_map[solver] = best_w
 
-        for solver, res in global_results.items():
-            all_summary_data.append({
-                "Target Mix": "GLOBAL_TRAIN",
-                "Solver": solver,
-                "Status": res['status'],
-                "Score (%)": round(res['score'], 2),
-                "L1 Dist": round(res['l1_dist'], 4),
-                "Target Data Ratio": np.round(global_oracle, 2),
-                "Learned Weights": np.round(res['weights'], 2),
-            })
+        log_print(f"Global Weights Selected for Static Mode: {global_weights_map}")
 
-    # --- FILE NAME CONSTRUCTION ---
-    filename = f'Results_{optimization_scope}_{sampling_strategy}_{source_mode_str}_seed{seed}.txt'
+    # --- FILE NAME ---
+    filename = f'Sweep_Results_{optimization_scope}_{sampling_strategy}_{source_mode_str}_seed{seed}.txt'
     full_file_path = os.path.join(test_path, filename)
 
     # --- MAIN TARGET LOOP ---
     with open(full_file_path, 'w') as fp:
-        log_print(f"--- SAVING RESULTS TO: {filename} ---")
+        log_print(f"--- SAVING SWEEP RESULTS TO: {filename} ---")
 
         for target_domains in target_domains_sets:
             target_str = str(target_domains)
             log_print(f"\n=== Processing Target Mix: {target_str} ===")
 
-            # --- DETERMINE SOURCES TO USE ---
             if restrict_sources_to_target:
                 current_source_domains = [d for d in all_source_domains if d in target_domains]
             else:
@@ -504,63 +563,51 @@ def run_domain_adaptation(alpha_pos, alpha_neg, vr_model_type, seed, test_path,
             else:
                 Y_train, D_train, H_train = Y_eval, D_eval, H_eval  # Dummy
 
-            # 3. Solve & Evaluate
-            iter_results, oracle_z = solve_and_evaluate(
+            # 3. Solve & Evaluate (SWEEP)
+            # Pass global weights only if they exist
+            sweep_results, oracle_z = solve_and_evaluate_sweep(
                 Y_train, D_train, H_train,
                 Y_eval, D_eval, H_eval,
                 current_source_domains, seed, init_z_method, multi_dim, fp,
                 target_str, target_domains,
-                precomputed_weights=global_weights
+                precomputed_weights=global_weights_map
             )
 
-            # Log results
-            # NOTE: Calculate full oracle just for the table L1 distance correctness against the full world view
+            # --- LOGGING SWEEP RESULTS ---
             full_oracle = get_oracle_weights(target_domains, all_source_domains, mode="real_ratio")
 
-            for solver, res in iter_results.items():
-                # Map the learned weights (which might be size 2) back to size 3 for the table
-                full_weights_display = map_weights_to_full_source_list(
-                    res['weights'], current_source_domains, all_source_domains
-                )
+            fp.write(f"\nTARGET: {target_str}\n")
+            fp.write("-" * 80 + "\n")
 
-                fp.write(f"Target: {target_str} | Solver: {solver}\n")
-                fp.write(f"Status: {res['status']}\n")
-                fp.write(f"Weights (Active): {res['weights']}\n")
-                fp.write(f"Weights (Full): {full_weights_display}\n")
-                fp.write(f"Score: {res['score']:.2f}\n")
+            # Create a clean table structure in the text file
+            headers = f"{'Solver':<20} | {'Mult':<5} | {'Delta':<6} | {'Status':<25} | {'Score':<6} | {'Weights (Full)':<30}"
+            fp.write(headers + "\n")
+            fp.write("-" * 80 + "\n")
 
-                # Recalculate L1 Dist on the full vectors to be safe and consistent
-                real_l1_dist = np.sum(np.abs(full_weights_display - full_oracle))
-                fp.write(f"L1 Dist from Oracle: {real_l1_dist:.4f}\n\n")
+            for solver, res_list in sweep_results.items():
+                for r in res_list:
+                    w_full = map_weights_to_full_source_list(r['weights'], current_source_domains, all_source_domains)
 
-                all_summary_data.append({
-                    "Target Mix": target_str,
-                    "Solver": solver,
-                    "Status": res['status'],
-                    "Score (%)": round(res['score'], 2),
-                    "L1 Dist": round(real_l1_dist, 4),
-                    "Target Data Ratio": np.round(full_oracle, 2),
-                    "Learned Weights": np.round(full_weights_display, 2),
-                })
+                    mult_str = str(r['multiplier'])
+                    delta_str = f"{r['delta']:.2f}" if isinstance(r['delta'], float) else "N/A"
+                    score_str = f"{r['score']:.2f}" if r['score'] is not None else "---"
+                    w_str = str(np.round(w_full, 2)) if w_full is not None else "---"
 
-        # Summary
-        fp.write("\n\n" + "=" * 50 + "\nSUMMARY TABLE\n" + "=" * 50 + "\n")
-        df_summary = pd.DataFrame(all_summary_data)
-        fp.write(df_summary.to_string())
-        log_print("\nSUMMARY TABLE:\n")
-        log_print(df_summary.to_string())
+                    line = f"{solver:<20} | {mult_str:<5} | {delta_str:<6} | {r['status']:<25} | {score_str:<6} | {w_str:<30}"
+                    fp.write(line + "\n")
+                fp.write("-" * 40 + "\n")
+            fp.write("\n" + "=" * 80 + "\n")
 
 
 def task_run(date, seed, estimate_prob_type, init_z_method, multi_dim,
              model_type, pos_alpha, neg_alpha,
              classifiers, source_domains, opt_scope, sample_strat, restrict_sources):
-    # --- NAME CONSTRUCTION: Includes Scope, Strategy, and Source Restriction ---
     source_mode_str = "Sources_RESTRICTED" if restrict_sources else "Sources_ALL"
 
     test_path = (
         f'./{estimate_prob_type}_results_{date}/'
         f'init_z_{init_z_method}/use_multi_dim_{multi_dim}/seed_{seed}/'
-        f'{opt_scope}_{sample_strat}_{source_mode_str}'  # <--- UNIQUE FOLDER NAME
+        f'{opt_scope}_{sample_strat}_{source_mode_str}_SWEEP'
     )
     os.makedirs(test_path, exist_ok=True)
 
@@ -589,26 +636,20 @@ def main():
         except FileNotFoundError:
             print(f"Warning: Classifier for {domain} not found.")
 
-    # Using the best config found
+    # Config
     estimate_prob_types = ["OURS-STD-SCORE-WITH-KDE"]
     init_z_methods = ["err"]
     multi_dim_vals = [True]
-    date = '30_12_EXPERIMENTS'
+    date = '30_12_FINAL_SWEEP'
     seeds = [1]
 
     alphas_by_model = {
         "vrs": [(2, -2)],
     }
 
-    # --- CONFIGURATION ---
-
-    # 1. Choose Mode:
-    OPTIMIZATION_SCOPE = "per_target"  # 'global' or 'per_target'
-    SAMPLING_STRATEGY = "all_data"  # 'balanced_1000' or 'all_data'
-
-    # 2. Choose Source Strategy:
-    # True = Use ONLY sources present in target (e.g., Target=M+U -> Sources=M+U)
-    # False = Use ALL sources (e.g., Target=M+U -> Sources=M+U+S)
+    # Mode Settings
+    OPTIMIZATION_SCOPE = "per_target"
+    SAMPLING_STRATEGY = "all_data"
     RESTRICT_SOURCES = True
 
     tasks = []
@@ -626,8 +667,7 @@ def main():
                                  OPTIMIZATION_SCOPE, SAMPLING_STRATEGY, RESTRICT_SOURCES)
                             )
 
-    mode_desc = "RESTRICTED SOURCES" if RESTRICT_SOURCES else "ALL SOURCES"
-    print(f"Starting execution... Mode: {OPTIMIZATION_SCOPE} | Sampling: {SAMPLING_STRATEGY} | {mode_desc}")
+    print(f"Starting Sweep... Mode: {OPTIMIZATION_SCOPE} | Restricted: {RESTRICT_SOURCES}")
 
     Parallel(n_jobs=-1, backend="loky")(
         delayed(task_run)(*t) for t in tasks
