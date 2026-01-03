@@ -15,6 +15,9 @@ import torch.nn.functional as F
 import glob
 import sys
 import io
+import itertools
+from torchvision import models
+import torch.nn as nn
 
 # --- YOUR MODULES ---
 from dc import *
@@ -36,19 +39,74 @@ print("device = ", device)
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 torch.set_num_threads(1)
 
-# --- CONFIG ---
-SOURCE_ERRORS = {
-    'MNIST': 1.0 - 0.9948,
-    'USPS': 1.0 - 0.972596,
-    'SVHN': 1.0 - 0.949716
+# ==========================================
+# --- CONFIGURATION SECTION ---
+# ==========================================
+
+DATASET_MODE = "OFFICE"
+
+CONFIGS = {
+    "DIGITS": {
+        "DOMAINS": ['MNIST', 'USPS', 'SVHN'],
+        "CLASSES": 10,
+        "INPUT_DIM": 2048,
+        "SOURCE_ERRORS": {
+            'MNIST': 1.0 - 0.9948,
+            'USPS': 1.0 - 0.972596,
+            'SVHN': 1.0 - 0.949716
+        },
+        "TEST_SET_SIZES": {
+            'MNIST': 10000,
+            'USPS': 2007,
+            'SVHN': 26032
+        }
+    },
+    "OFFICE": {
+        "DOMAINS": ['Art', 'Clipart', 'Product', 'Real World'],
+        "CLASSES": 65,
+        "INPUT_DIM": 2048,
+        "SOURCE_ERRORS": {
+            'Art': 0.1111,
+            'Clipart': 0.0802,
+            'Product': 0.0315,
+            'Real World': 0.0734
+        },
+        "TEST_SET_SIZES": {
+            'Art': 490,
+            'Clipart': 870,
+            'Product': 880,
+            'Real World': 870
+        }
+    }
 }
 
-TEST_SET_SIZES = {
-    'MNIST': 10000,
-    'USPS': 2007,
-    'SVHN': 26032
-}
+CURRENT_CFG = CONFIGS[DATASET_MODE]
+SOURCE_ERRORS = CURRENT_CFG["SOURCE_ERRORS"]
+TEST_SET_SIZES = CURRENT_CFG["TEST_SET_SIZES"]
+ALL_DOMAINS_LIST = CURRENT_CFG["DOMAINS"]
+NUM_CLASSES = CURRENT_CFG["CLASSES"]
+INPUT_DIM = CURRENT_CFG["INPUT_DIM"]
 
+print(f"--- RUNNING IN MODE: {DATASET_MODE} ---")
+print(f"--- Domains: {ALL_DOMAINS_LIST} ---")
+
+
+class FeatureExtractor(nn.Module):
+    def __init__(self, original_model):
+        super(FeatureExtractor, self).__init__()
+        self.backbone = nn.Sequential(*list(original_model.children())[:-1])
+        self.head = original_model.fc
+
+    def forward(self, x):
+        feats = self.backbone(x)
+        feats = torch.flatten(feats, 1)
+        logits = self.head(feats)
+        return feats, logits
+
+
+# ==========================================
+# --- LOGIC ---
+# ==========================================
 
 def log_print(*args, **kwargs):
     pid = os.getpid()
@@ -80,10 +138,11 @@ def get_oracle_weights(target_domains, source_domains, mode="real_ratio"):
     total_samples = 0
     for domain in target_domains:
         if domain in TEST_SET_SIZES: total_samples += TEST_SET_SIZES[domain]
+    if total_samples == 0: total_samples = 1
 
     for source in source_domains:
         if source in target_domains:
-            weights.append(TEST_SET_SIZES[source] / total_samples)
+            weights.append(TEST_SET_SIZES.get(source, 0) / total_samples)
         else:
             weights.append(0.0)
     return np.array(weights)
@@ -93,7 +152,7 @@ def create_loaders(domains, seed, strategy):
     loaders = []
     total_size = 0
     for domain in domains:
-        _, full_loader = Data.get_data_loaders(domain, seed=seed)
+        _, full_loader, _ = Data.get_data_loaders(domain, seed=seed)
         if strategy == "balanced_1000":
             indices = list(range(min(1000, len(full_loader.dataset))))
             subset = torch.utils.data.Subset(full_loader.dataset, indices)
@@ -107,11 +166,9 @@ def create_loaders(domains, seed, strategy):
 
 
 def build_DP_model_Classes(data_loaders, data_size, source_domains, models, classifiers,
-                           normalize_factors, estimate_prob_type):
-    # This function is now run ONCE per target in the main process
+                           normalize_factors, estimate_prob_type, vae_norm_stats):
     log_print(f"--- Building Matrices (Size: {data_size}) ---")
-
-    C = 10
+    C = NUM_CLASSES
     Y = np.zeros((data_size, C))
     D = np.zeros((data_size, C, len(source_domains)))
     H = np.zeros((data_size, C, len(source_domains)))
@@ -123,25 +180,36 @@ def build_DP_model_Classes(data_loaders, data_size, source_domains, models, clas
             N = len(data)
             y_vals = label.cpu().detach().numpy()
             one_hot = np.zeros((y_vals.size, C))
-            one_hot[np.arange(y_vals.size), y_vals] = 1
+            valid_idx = y_vals < C
+            one_hot[np.arange(y_vals.size)[valid_idx], y_vals[valid_idx]] = 1
             Y[i:i + N] = one_hot
 
             for k, source_domain in enumerate(source_domains):
                 with torch.no_grad():
-                    output = classifiers[source_domain](data)
-                    H[i:i + N, :, k] = F.softmax(output, dim=1).cpu().detach().numpy()
+                    if DATASET_MODE == "OFFICE":
+                        features, logits = classifiers[source_domain](data)
+                    else:
+                        logits = classifiers[source_domain](data)
+                        features = data.view(N, -1)
+
+                    H[i:i + N, :, k] = F.softmax(logits, dim=1).cpu().detach().numpy()
 
                     if estimate_prob_type == "GMSA":
-                        D[i:i + N, :, k] = output.cpu().detach().numpy()
+                        D[i:i + N, :, k] = logits.cpu().detach().numpy()
                     elif estimate_prob_type in ["OURS-STD-SCORE", "OURS-KDE", "OURS-STD-SCORE-WITH-KDE"]:
-                        x_hat, _, _ = models[source_domain](data)
+                        vae_input = features
+                        if DATASET_MODE == "OFFICE":
+                            min_v, max_v = vae_norm_stats[source_domain]
+                            vae_input = (features - min_v) / (max_v - min_v + 1e-6)
+                            vae_input = torch.clamp(vae_input, 0.0, 1.0)
+
+                        x_hat, _, _ = models[source_domain](vae_input)
                         log_p = models[source_domain].compute_log_probabitility_gaussian(
-                            x_hat, data.view(data.shape[0], -1), torch.zeros_like(x_hat)
+                            x_hat, vae_input, torch.zeros_like(x_hat)
                         )
                         D[i:i + N, :, k] = torch.tile(log_p[:, None], (1, C)).cpu().detach().numpy()
             i += N
 
-    # KDE / Normalization
     for k, source_domain in enumerate(source_domains):
         if estimate_prob_type in ["OURS-KDE", "OURS-STD-SCORE", "OURS-STD-SCORE-WITH-KDE"]:
             raw_scores = D[:, 0, k].reshape(-1, 1)
@@ -153,29 +221,28 @@ def build_DP_model_Classes(data_loaders, data_size, source_domains, models, clas
 
             if "KDE" in estimate_prob_type:
                 score_std = np.std(scores_proc)
-                if score_std < 0.05:
-                    params = {"bandwidth": np.linspace(0.04, 0.5, 25)}
-                else:
-                    params = {"bandwidth": np.logspace(-2, 2, 40)}
-
-                # Fit on subset to be fast
+                params = {"bandwidth": np.linspace(0.04, 0.5, 25)} if score_std < 0.05 else {
+                    "bandwidth": np.logspace(-2, 2, 40)}
                 subset_idx = np.random.permutation(len(scores_proc))[:3000]
                 grid = GridSearchCV(KernelDensity(), params, n_jobs=1, cv=3)
                 grid.fit(scores_proc[subset_idx])
-
                 kde = grid.best_estimator_
                 D[:, :, k] = np.tile(np.exp(kde.score_samples(scores_proc)).reshape(-1, 1), (1, C))
             else:
                 D[:, :, k] = np.tile(np.exp(-np.abs(scores_proc)), (1, C))
 
-    # Noise Gate
+    # --- FIX: SCALING INSTEAD OF GLOBAL NORMALIZATION ---
+    # 1. Mask Weak (Optional - keep to filter noise)
     mask_weak = D < (D.max(axis=2, keepdims=True) * 0.3)
     D[mask_weak] = 0.0
 
-    # Final Norm
+    # 2. Scaling per domain to keep numbers numeric-friendly
+    # Instead of dividing by sum (which becomes huge -> 0), divide by max (becomes 1.0)
     for k in range(len(source_domains)):
-        total = D[:, :, k].sum()
-        D[:, :, k] = D[:, :, k] / total if total > 0 else 1.0 / len(D)
+        max_val = D[:, :, k].max()
+        if max_val > 1e-9:
+            D[:, :, k] = D[:, :, k] / max_val
+    # --- END FIX ---
 
     return Y, D, H
 
@@ -189,30 +256,137 @@ def evaluate_accuracy(weights, D, H, Y, multi_dim):
     return accuracy_score(y_true, final.argmax(axis=1)) * 100.0
 
 
-def run_solver_sweep_worker(Y, D, H, eps_mult, source_domains, target_domains,
-                            seed, init_z_method, multi_dim, precomputed_weights,
-                            all_source_domains):
-    """
-    Worker function: Runs the Deltas Sweep for a specific Epsilon.
-    Receives Pre-Built Matrices Y, D, H.
-    """
+# ==========================================
+# --- NEW DEBUG FUNCTION ---
+# ==========================================
+def debug_matrices(Y, D, H, sources):
+    print("\n" + "=" * 40)
+    print("   DEBUG: MATRICES SANITY CHECK")
+    print("=" * 40)
+
+    N, C, K = D.shape
+    print(f"Shape: N={N}, Classes={C}, Sources={K}")
+
+    # 1. Source Accuracies (on this subset)
+    y_true = Y.argmax(axis=1)
+    print("\n--- 1. Source Accuracies (on this subset) ---")
+    for k in range(K):
+        preds = H[:, :, k].argmax(axis=1)
+        acc = (preds == y_true).mean()
+        print(f"   Source {sources[k]}: {acc:.2%}")
+
+    # 2. Density (D) Stats
+    print("\n--- 2. Density (D) Stats ---")
+    for k in range(K):
+        d_flat = D[:, :, k].flatten()
+        # Filter zeroes
+        d_active = d_flat[d_flat > 1e-6]
+        mean_val = d_active.mean() if len(d_active) > 0 else 0.0
+        max_val = d_active.max() if len(d_active) > 0 else 0.0
+        min_val = d_active.min() if len(d_active) > 0 else 0.0
+        print(f"   Source {sources[k]}: Mean={mean_val:.4f}, Max={max_val:.4f}, Min={min_val:.4f}")
+
+    # 3. Model Overlap / Agreement
+    if K == 2:
+        preds_0 = H[:, :, 0].argmax(axis=1)
+        preds_1 = H[:, :, 1].argmax(axis=1)
+        agreement = (preds_0 == preds_1).mean()
+        print(f"\n--- 3. Model Agreement ---")
+        print(f"   Agreement between {sources[0]} and {sources[1]}: {agreement:.2%}")
+
+    # 4. Normalization Check
+    sums = D.sum(axis=2)  # Sum across sources
+    print(f"\n--- 4. Normalization Check ---")
+    print(f"   Avg Sum across sources (Should be ~1.0): {sums.mean():.4f}")
+
+    print("=" * 40 + "\n")
+
+
+# --- FUNCTION TO CALCULATE BASELINES (Oracle, Uniform, DC) ONLY ONCE ---
+def run_baselines(Y, D, H, source_domains, target_domains, seed, init_z_method, multi_dim, all_source_domains):
     output_buffer = io.StringIO()
 
-    # Constants
-    errors_list = [(SOURCE_ERRORS[d] + 0.01) * eps_mult for d in source_domains]
-    eps_global = max(errors_list)
-    eps_vector = np.array(errors_list)
-
+    # 1. Oracle & Uniform
     oracle_z = get_oracle_weights(target_domains, source_domains, mode="real_ratio")
     uniform_w = np.ones(len(source_domains)) / len(source_domains)
 
+    # Evaluate Oracle
+    sc = evaluate_accuracy(oracle_z, D, H, Y, multi_dim)
+    w_full = map_weights_to_full_source_list(oracle_z, source_domains, all_source_domains)
+
+    output_buffer.write(
+        f"{'ORACLE':<18} | {'N/A':<4} | {'N/A':<4} | {'N/A':<6} | {'Oracle':<22} | {sc:<20.4f} | {str(np.round(w_full, 4)):<30}\n")
+    output_buffer.write("-" * 120 + "\n")
+    print(f"    >>> [Baseline] ORACLE  | Acc: {sc:.2f}%")
+
+    # Evaluate Uniform
+    sc = evaluate_accuracy(uniform_w, D, H, Y, multi_dim)
+    w_full = map_weights_to_full_source_list(uniform_w, source_domains, all_source_domains)
+
+    output_buffer.write(
+        f"{'UNIFORM':<18} | {'N/A':<4} | {'N/A':<4} | {'N/A':<6} | {'Fixed':<22} | {sc:<20.4f} | {str(np.round(w_full, 4)):<30}\n")
+    output_buffer.write("-" * 120 + "\n")
+    print(f"    >>> [Baseline] UNIFORM | Acc: {sc:.2f}%")
+
+    # 2. DC Solver (Run once as a baseline)
+    scores, ws = [], []
+    K = len(source_domains)
+    C_count = NUM_CLASSES
+
+    for i in range(4):
+        try:
+            dp = init_problem_from_model(Y, D, H, p=K, C=C_count)
+            prob = ConvexConcaveProblem(dp)
+            slv = ConvexConcaveSolver(prob, seed + i * 100, init_z_method)
+            z_c, _, _ = slv.solve()
+            if z_c is not None:
+                scores.append(evaluate_accuracy(z_c, D, H, Y, multi_dim))
+                ws.append(z_c)
+        except:
+            continue
+
+    if scores:
+        score_disp = f"{np.mean(scores):.4f} ± {np.std(scores):.4f}"
+        learned_z = ws[np.argmax(scores)]
+        status = "Converged"
+        print(f"    >>> [Baseline] DC      | Acc: {evaluate_accuracy(learned_z, D, H, Y, multi_dim):.2f}%")
+    else:
+        status = "Failed"
+        score_disp = "---"
+        learned_z = None
+        print(f"    >>> [Baseline] DC      | Failed")
+
+    w_full = map_weights_to_full_source_list(learned_z, source_domains, all_source_domains)
+    w_str = str(np.round(w_full, 4)) if w_full is not None else "---"
+
+    output_buffer.write(
+        f"{'DC':<18} | {'N/A':<4} | {'N/A':<4} | {'N/A':<6} | {status:<22} | {score_disp:<20} | {w_str:<30}\n")
+    output_buffer.write("-" * 120 + "\n")
+
+    return output_buffer.getvalue()
+
+
+# --- WORKER: Only runs CVXPY sweep ---
+def run_solver_sweep_worker(Y, D, H, eps_mult, source_domains, target_domains,
+                            seed, init_z_method, multi_dim, precomputed_weights,
+                            all_source_domains):
+    output_buffer = io.StringIO()
+
+    errors_list = [(SOURCE_ERRORS.get(d, 0.1) + 0.01) * eps_mult for d in source_domains]
+    eps_global = max(errors_list)
+    eps_vector = np.array(errors_list)
+
     K = len(source_domains)
     max_entropy = np.log(K) if K > 1 else 0.0
-    multipliers = [0.5, 0.8, 1.0, 1.3, 1.5, 2.0]
-    solvers = ["ORACLE", "UNIFORM", "DC", "CVXPY_GLOBAL", "CVXPY_PER_DOMAIN"]
 
-    # Subset for Optimization
-    SUBSET = 2000
+    # Reduced multipliers list to save time
+    multipliers = [1.0, 1.2]
+
+    # Only optimizing solvers here
+    solvers = ["CVXPY_GLOBAL", "CVXPY_PER_DOMAIN"]
+
+    SUBSET = 3000  # Increased to 3000 as requested
+
     if len(Y) > SUBSET:
         np.random.seed(seed)
         idx = np.random.choice(len(Y), SUBSET, replace=False)
@@ -224,77 +398,40 @@ def run_solver_sweep_worker(Y, D, H, eps_mult, source_domains, target_domains,
     for solver in solvers:
         results[solver] = []
 
-        # Fixed Solvers
-        if solver in ["ORACLE", "UNIFORM"] or (precomputed_weights and solver in precomputed_weights):
-            if solver == "ORACLE":
-                w, st = oracle_z, "Oracle"
-            elif solver == "UNIFORM":
-                w, st = uniform_w, "Fixed"
-            else:
-                w, st = precomputed_weights[solver], "Precomputed"
-
-            sc = evaluate_accuracy(w, D, H, Y, multi_dim)
-            results[solver].append({
-                "mult": "N/A", "delta": "N/A", "w": w, "sc": f"{sc:.4f}", "st": st
-            })
-            continue
-
-        # Dynamic Sweep
         for mult in multipliers:
             delta_val = mult * max_entropy if K > 1 else 0.0
             learned_z, status, score_disp = None, "Unknown", "---"
 
-            if solver == "DC":
-                scores, ws = [], []
-                for i in range(4):
-                    try:
-                        dp = init_problem_from_model(Y_opt, D_opt, H_opt, p=K, C=10)
-                        prob = ConvexConcaveProblem(dp)
-                        slv = ConvexConcaveSolver(prob, seed + i * 100, init_z_method)
-                        z_c, _, _ = slv.solve()
-                        if z_c is not None:
-                            scores.append(evaluate_accuracy(z_c, D, H, Y, multi_dim))
-                            ws.append(z_c)
-                    except:
-                        continue
+            try:
+                delta_vec = np.array([delta_val] * K)
+                if solver == "CVXPY_GLOBAL":
+                    # Using SCS as requested
+                    learned_z = solve_convex_problem_mosek(Y_opt, D_opt, H_opt, delta=delta_val, epsilon=eps_global,
+                                                           solver_type='SCS')
+                elif solver == "CVXPY_PER_DOMAIN":
+                    # Using SCS as requested
+                    learned_z = solve_convex_problem_per_domain(Y_opt, D_opt, H_opt, delta=delta_vec,
+                                                                epsilon=eps_vector, solver_type='SCS')
+            except:
+                pass
 
-                if scores:
-                    score_disp = f"{np.mean(scores):.4f} ± {np.std(scores):.4f}"
-                    learned_z = ws[np.argmax(scores)]
-                    status = "Converged"
-                else:
-                    status = "Failed"
-            else:
-                try:
-                    delta_vec = np.array([delta_val] * K)
-                    if solver == "CVXPY_GLOBAL":
-                        learned_z = solve_convex_problem_mosek(Y_opt, D_opt, H_opt, delta=delta_val, epsilon=eps_global,
-                                                               solver_type='SCS')
-                    elif solver == "CVXPY_PER_DOMAIN":
-                        learned_z = solve_convex_problem_per_domain(Y_opt, D_opt, H_opt, delta=delta_vec,
-                                                                    epsilon=eps_vector, solver_type='SCS')
-                except:
-                    pass
-
-            # Validation
+            # --- UPDATED LOGIC FOR HANDLING NONE / FAILURE ---
             if learned_z is None:
-                if status == "Unknown": status = "Infeasible"
+                status = "Failed"
+                score_disp = "---"
+                # Print failure to console
+                print(f"    >>> [Worker] Eps={eps_mult} | {solver} | Mult={mult} | FAILED")
             else:
-                is_uniform = np.allclose(learned_z, uniform_w, atol=1e-9)
-                # if abs(np.sum(learned_z) - 1.0) > 1e-2:
-                #     status, learned_z = "Explosion", None
-                if is_uniform and K > 1:
-                    status, learned_z = "Fallback", None
-                elif solver != "DC":
-                    status = "Converged"
-                    score_disp = f"{evaluate_accuracy(learned_z, D, H, Y, multi_dim):.4f}"
+                status = "Converged"
+                acc_val = evaluate_accuracy(learned_z, D, H, Y, multi_dim)
+                score_disp = f"{acc_val:.4f}"
+                # Print success to console
+                print(f"    >>> [Worker] Eps={eps_mult} | {solver} | Mult={mult} | Acc: {acc_val:.2f}%")
 
             results[solver].append({
                 "mult": mult, "delta": delta_val, "w": learned_z, "sc": score_disp, "st": status
             })
-            if solver == "DC": break  # Run DC once per eps
 
-    # Format output string
     for solver, res_list in results.items():
         for r in res_list:
             w_full = map_weights_to_full_source_list(r['w'], source_domains, all_source_domains)
@@ -316,88 +453,140 @@ def task_run(date, seed, estimate_prob_type, init_z_method, multi_dim,
 
     source_mode_str = "Sources_RESTRICTED" if restrict_sources else "Sources_ALL"
     test_path = (
-        f'./{estimate_prob_type}_results_{date}/'
+        f'./{estimate_prob_type}_results_{DATASET_MODE}_{date}/'
         f'init_z_{init_z_method}/use_multi_dim_{multi_dim}/seed_{seed}/'
         f'{opt_scope}_{sample_strat}_{source_mode_str}_OPTIMIZED_PARALLEL'
     )
     os.makedirs(test_path, exist_ok=True)
 
-    # 1. LOAD MODELS ONCE
+    # 1. LOAD MODELS & STATS
     models = {}
-    normalize_factors = {'MNIST': (0, 0), 'USPS': (0, 0), 'SVHN': (0, 0)}
+    normalize_factors = {d: (0, 0) for d in all_source_domains}
+    vae_norm_stats = {d: (0, 1) for d in all_source_domains}
+
     for domain in all_source_domains:
-        model = vr_model(pos_alpha, neg_alpha).to(device)
-        path = glob.glob(f"./models_{domain}_seed{seed}_*/{model_type}_*")[0]
-        try:
-            model.load_state_dict(torch.load(path, map_location=torch.device(device)))
-            models[domain] = model
-        except:
+        model = vr_model(INPUT_DIM, pos_alpha, neg_alpha).to(device)
+        path_pattern = f"./models_{domain}_seed{seed}_*/{model_type}_*"
+        paths = glob.glob(path_pattern)
+
+        if not paths:
+            print(f"[WARNING] No model found for {domain} with pattern {path_pattern}")
             continue
 
-        # Calc Factors
+        try:
+            model.load_state_dict(torch.load(paths[0], map_location=torch.device(device)))
+            models[domain] = model
+        except Exception as e:
+            print(f"[ERROR] Loading model for {domain}: {e}")
+            continue
+
         if "STD-SCORE" in estimate_prob_type:
-            tl, _ = Data.get_data_loaders(domain, seed=seed)
+            train_loader, _, _ = Data.get_data_loaders(domain, seed=seed)
+            extractor = classifiers[domain]
+            all_feats = []
+
+            if DATASET_MODE == "OFFICE":
+                with torch.no_grad():
+                    for i, (imgs, _) in enumerate(train_loader):
+                        if i > 20: break
+                        imgs = imgs.to(device)
+                        feats, _ = extractor(imgs)
+                        all_feats.append(feats)
+
+                cat_feats = torch.cat(all_feats, dim=0)
+                min_v = cat_feats.min().to(device)
+                max_v = cat_feats.max().to(device)
+                vae_norm_stats[domain] = (min_v, max_v)
+
             probs = []
-            for i, (d, _) in enumerate(tl):
+            for i, (imgs, _) in enumerate(train_loader):
                 if i > 50: break
                 with torch.no_grad():
-                    x_hat, _, _ = models[domain](d.to(device))
-                    probs.append(
-                        models[domain].compute_log_probabitility_bernoulli(x_hat, d.to(device).view(d.shape[0], -1)))
-            all_p = torch.cat(probs, 0)
-            normalize_factors[domain] = (all_p.mean(), all_p.std())
+                    imgs = imgs.to(device)
+                    if DATASET_MODE == "OFFICE":
+                        feats, _ = extractor(imgs)
+                        min_v, max_v = vae_norm_stats[domain]
+                        vae_in = (feats - min_v) / (max_v - min_v + 1e-6)
+                        vae_in = torch.clamp(vae_in, 0.0, 1.0)
+                    else:
+                        vae_in = imgs.view(imgs.shape[0], -1)
 
-    # 2. GLOBAL WEIGHTS (Optional, Serial)
-    global_weights_cache = {}
-    if opt_scope == "global":
-        log_print("Calculating Global Weights...")
-        tl, ts = create_loaders(all_source_domains, seed, sample_strat)
-        Y_g, D_g, H_g = build_DP_model_Classes(tl, ts, all_source_domains, models, classifiers, normalize_factors,
-                                               estimate_prob_type)
+                    x_hat, _, _ = models[domain](vae_in)
+                    probs.append(models[domain].compute_log_probabitility_bernoulli(x_hat, vae_in))
 
-        # Parallel Global Calculation for different epsilons? Or simple serial. Serial is fast enough here.
-        for eps in [1.0, 1.1, 1.2]:
-            res = run_solver_sweep_worker(Y_g, D_g, H_g, eps, all_source_domains, all_source_domains, seed,
-                                          init_z_method, multi_dim, None, all_source_domains)
-            # Parse result manually or change worker to return dict.
-            # For simplicity, let's assume global mode is less critical for parallel optimization right now or just run it inside worker logic if passed.
-            # To keep code simple: We skip caching complex global weights in this parallel version,
-            # OR we just pass None and let them run dynamic. Let's pass None for now.
+            if len(probs) > 0:
+                all_p = torch.cat(probs, 0)
+                normalize_factors[domain] = (all_p.mean(), all_p.std())
 
-    # 3. MAIN LOOP - SERIAL TARGETS, PARALLEL EPSILONS
+    # 3. MAIN LOOP
     filename = f'Sweep_Results_OPTIMIZED_{seed}.txt'
-    with open(os.path.join(test_path, filename), 'w') as fp:
-        log_print(f"Writing to {filename}")
+    full_file_path = os.path.join(test_path, filename)
 
-        target_sets = [
-            ['MNIST', 'USPS', 'SVHN'], ['MNIST', 'USPS'], ['MNIST', 'SVHN'], ['USPS', 'SVHN']
-            # ,
-            # ['MNIST'], ['USPS'], ['SVHN']
-        ]
+    # --- RESUME LOGIC ---
+    completed_mixes = []
+    if os.path.exists(full_file_path):
+        print(f"[RESUME] Scanning existing file: {full_file_path}")
+        with open(full_file_path, 'r') as f_read:
+            for line in f_read:
+                if "TARGET MIX:" in line:
+                    clean_mix = line.split("TARGET MIX:")[1].strip()
+                    completed_mixes.append(clean_mix)
+        print(f"[RESUME] Found {len(completed_mixes)} completed tasks. Skipping them.")
+
+    with open(full_file_path, 'a') as fp:
+        log_print(f"Appending to {filename}")
+
+        target_sets = []
+        n_domains = len(all_source_domains)
+        min_r = 2
+        max_r = n_domains
+        for r in range(min_r, max_r + 1):
+            for subset in itertools.combinations(all_source_domains, r):
+                target_sets.append(list(subset))
 
         for target in target_sets:
             target_str = str(target)
+
+            if target_str in completed_mixes:
+                print(f"[SKIP] Target {target_str} already done.")
+                continue
+
             fp.write(f"\n{'=' * 120}\nTARGET MIX: {target_str}\n{'=' * 120}\n")
             header = f"{'Solver':<18} | {'Eps':<4} | {'Mult':<4} | {'Delta':<6} | {'Status':<22} | {'Score':<20} | {'Weights':<30}\n"
             fp.write(header + "-" * 120 + "\n")
+            fp.flush()
 
-            # A. PREPARE MATRICES (ONCE PER TARGET)
             if restrict_sources:
                 src = [d for d in all_source_domains if d in target]
             else:
                 src = all_source_domains
 
-            log_print(f"Building Matrices for {target_str}...")
+            log_print(f"Building Matrices for {target_str} using sources: {src}")
             el, es = create_loaders(target, seed, "all_data")
-            Y_ev, D_ev, H_ev = build_DP_model_Classes(el, es, src, models, classifiers, normalize_factors,
-                                                      estimate_prob_type)
 
-            # For training data, if per_target and all_data, it's the same.
+            try:
+                Y_ev, D_ev, H_ev = build_DP_model_Classes(el, es, src, models, classifiers, normalize_factors,
+                                                          estimate_prob_type, vae_norm_stats)
+            except Exception as e:
+                log_print(f"Error building matrices for {target}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+
             Y_tr, D_tr, H_tr = Y_ev, D_ev, H_ev
 
-            # B. PARALLEL EXECUTION (FOR EPSILONS)
-            # Joblib efficiently handles shared memory for numpy arrays (read-only)
-            log_print(f"   -> Launching parallel solvers for Epsilons [1.0, 1.1, 1.2]")
+            # >>> INSERTED DEBUG FUNCTION CALL HERE <<<
+            debug_matrices(Y_tr, D_tr, H_tr, src)
+
+            # --- STEP 1: CALCULATE BASELINES ONCE ---
+            log_print("    -> Calculating Baselines (Oracle, Uniform, DC)...")
+            baseline_str = run_baselines(Y_tr, D_tr, H_tr, src, target, seed, init_z_method, multi_dim,
+                                         all_source_domains)
+            fp.write(baseline_str)
+            fp.flush()
+
+            # --- STEP 2: RUN PARALLEL SWEEP (OPTIMIZATION) ---
+            log_print(f"    -> Launching parallel solvers for Epsilons [1.0, 1.1, 1.2]")
 
             parallel_results = Parallel(n_jobs=-1, backend="loky")(
                 delayed(run_solver_sweep_worker)(
@@ -405,29 +594,49 @@ def task_run(date, seed, estimate_prob_type, init_z_method, multi_dim,
                 ) for eps in [1.0, 1.1, 1.2]
             )
 
-            # C. WRITE RESULTS IMMEDIATELY
             for res_str in parallel_results:
                 fp.write(res_str)
                 fp.write("." * 120 + "\n")
 
-            fp.flush()  # Ensure write to disk
+            fp.flush()
 
 
 def main():
     print("device = ", device)
     classifiers = {}
-    domains = ['MNIST', 'USPS', 'SVHN']
+    domains = ALL_DOMAINS_LIST
+
+    print(f"Loading classifiers for {DATASET_MODE}...")
+
     for d in domains:
-        classifier = ClSFR.Grey_32_64_128_gp().to(device)
         try:
-            classifier.load_state_dict(
-                torch.load(f"./classifiers_new/{d}_classifier.pt", map_location=torch.device(device)))
+            path = f"./classifiers_new/{d}_classifier.pt"
+
+            if DATASET_MODE == "DIGITS":
+                classifier = ClSFR.Grey_32_64_128_gp().to(device)
+                classifier.load_state_dict(
+                    torch.load(path, map_location=torch.device(device)))
+            elif DATASET_MODE == "OFFICE":
+                full_model = models.resnet50(weights=None)
+                full_model.fc = nn.Linear(full_model.fc.in_features, NUM_CLASSES)
+                full_model.load_state_dict(
+                    torch.load(path, map_location=torch.device(device)))
+                classifier = FeatureExtractor(full_model).to(device)
+
+            if hasattr(classifier, 'eval'):
+                classifier.eval()
+
             classifiers[d] = classifier
-        except:
+            print(f"Loaded {d}")
+        except Exception as e:
+            print(f"[WARNING] Could not load classifier for {d}: {e}")
             pass
 
-    # Config
-    date = '01_01'
+    if len(classifiers) == 0:
+        print("[ERROR] No classifiers loaded. Check paths.")
+        return
+
+    date = '03_01_debug'
     for seed in [1]:
         task_run(date, seed, "OURS-STD-SCORE-WITH-KDE", "err", True, "vrs", 2, -2,
                  classifiers, domains, "per_target", "all_data", True)

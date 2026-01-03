@@ -23,10 +23,8 @@ def calculate_expected_loss(Y, H, D, num_sources):
 
 def solve_convex_problem_mosek(Y, D, H, delta=1e-2, epsilon=1e-2, solver_type='SCS'):
     """
-    Solves the convex optimization problem using the specified solver (SCS or MOSEK).
-
-    Args:
-        solver_type (str): 'SCS' (fast, default) or 'MOSEK' (precise but slower).
+    Solves the convex optimization problem using the specified solver.
+    Returns weights w if successful, or None if infeasible/failed.
     """
 
     # --- STEP 1: Handle Shapes ---
@@ -35,13 +33,11 @@ def solve_convex_problem_mosek(Y, D, H, delta=1e-2, epsilon=1e-2, solver_type='S
         D_flat = D.reshape(-1, k)
         H_flat = H.reshape(-1, k)
         Y_flat = Y.reshape(-1)
-        print(f"[{solver_type} Solver] Flattening from ({N_orig}, {C}, {k}) to ({N_orig * C}, {k})")
         D = D_flat
         H = H_flat
         Y = Y_flat
     else:
         N, k = D.shape
-        print(f"[{solver_type} Solver] Standard input detected. Shape: ({N}, {k})")
 
     N, k = D.shape
 
@@ -86,30 +82,32 @@ def solve_convex_problem_mosek(Y, D, H, delta=1e-2, epsilon=1e-2, solver_type='S
     # --- STEP 3: Solve with Selected Solver ---
     prob = cp.Problem(objective, constraints)
 
+    # PRINT 1: Notification that the solver is starting
+    print(f"   >>> [CVXPY] Starting {solver_type} solve (N={N}, k={k})...")
+
     try:
         if solver_type == 'SCS':
-            print("   >>> SCS Solver starting... (Fast Mode)")
-            # eps=1e-3 is usually sufficient for ML weighting tasks
-            prob.solve(solver=cp.SCS, verbose=True, eps=1e-3, max_iters=5000)
+            prob.solve(solver=cp.SCS, verbose=False, eps=1e-3, max_iters=5000)
 
         elif solver_type == 'MOSEK':
-            print("   >>> MOSEK Solver starting... (High Precision Mode)")
-            prob.solve(solver=cp.MOSEK, verbose=True)
+            prob.solve(solver=cp.MOSEK, verbose=False)
 
         elif solver_type == 'CLARABEL':
-            print("   >>> CLARABEL Solver starting...")
-            prob.solve(solver=cp.CLARABEL, verbose=True)
+            prob.solve(solver=cp.CLARABEL, verbose=False)
 
         else:
             print(f"   !!! Unknown solver {solver_type}, defaulting to SCS")
-            prob.solve(solver=cp.SCS, verbose=True, eps=1e-3)
+            prob.solve(solver=cp.SCS, verbose=False, eps=1e-3)
 
     except Exception as e:
-        print(f"   !!! Solver Error: {e}")
+        print(f"   !!! Solver Exception: {e}")
+        return None
 
     # Check status
     if prob.status not in ["optimal", "optimal_inaccurate"]:
-        print(f"   [{solver_type} Solver] Warning: Status {prob.status}. Returning uniform.")
-        return np.ones(k) / k
+        print(f"   !!! [CVXPY] Failed/Infeasible. Status: {prob.status}")
+        return None
 
+    # PRINT 2: Notification of success and the weights found
+    print(f"   >>> [CVXPY] Solved! Weights: {np.round(w.value, 3)}")
     return w.value
