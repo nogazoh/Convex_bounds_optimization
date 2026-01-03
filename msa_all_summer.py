@@ -16,7 +16,7 @@ import glob
 import sys
 import io
 import itertools
-from torchvision import models
+from torchvision import models, transforms
 import torch.nn as nn
 
 # --- YOUR MODULES ---
@@ -50,33 +50,15 @@ CONFIGS = {
         "DOMAINS": ['MNIST', 'USPS', 'SVHN'],
         "CLASSES": 10,
         "INPUT_DIM": 2048,
-        "SOURCE_ERRORS": {
-            'MNIST': 1.0 - 0.9948,
-            'USPS': 1.0 - 0.972596,
-            'SVHN': 1.0 - 0.949716
-        },
-        "TEST_SET_SIZES": {
-            'MNIST': 10000,
-            'USPS': 2007,
-            'SVHN': 26032
-        }
+        "SOURCE_ERRORS": {'MNIST': 1.0 - 0.9948, 'USPS': 1.0 - 0.972596, 'SVHN': 1.0 - 0.949716},
+        "TEST_SET_SIZES": {'MNIST': 10000, 'USPS': 2007, 'SVHN': 26032}
     },
     "OFFICE": {
         "DOMAINS": ['Art', 'Clipart', 'Product', 'Real World'],
         "CLASSES": 65,
         "INPUT_DIM": 2048,
-        "SOURCE_ERRORS": {
-            'Art': 0.1111,
-            'Clipart': 0.0802,
-            'Product': 0.0315,
-            'Real World': 0.0734
-        },
-        "TEST_SET_SIZES": {
-            'Art': 490,
-            'Clipart': 870,
-            'Product': 880,
-            'Real World': 870
-        }
+        "SOURCE_ERRORS": {'Art': 0.1111, 'Clipart': 0.0802, 'Product': 0.0315, 'Real World': 0.0734},
+        "TEST_SET_SIZES": {'Art': 490, 'Clipart': 870, 'Product': 880, 'Real World': 870}
     }
 }
 
@@ -102,6 +84,32 @@ class FeatureExtractor(nn.Module):
         feats = torch.flatten(feats, 1)
         logits = self.head(feats)
         return feats, logits
+
+
+# ==========================================
+# --- HELPER: ON-THE-FLY FIX ---
+# ==========================================
+def fix_batch_office_home(data):
+    """
+    1. Resizes to 224x224 (ResNet Requirement).
+    2. Applies ImageNet Normalization manually on tensor.
+    """
+    if DATASET_MODE == "OFFICE":
+        # 1. Resize if smaller than 224
+        if data.shape[-1] < 224:
+            data = F.interpolate(data, size=(224, 224), mode='bilinear', align_corners=False)
+
+        # 2. Normalize (ImageNet stats)
+        # mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(data.device)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(data.device)
+
+        # Check if data is already normalized (centered around 0) or raw (0-1)
+        # If mean is small (<0.1), it might be normalized already. If mean is ~0.5, it's 0-1.
+        if data.mean() > 0.1:
+            data = (data - mean) / std
+
+    return data
 
 
 # ==========================================
@@ -177,6 +185,11 @@ def build_DP_model_Classes(data_loaders, data_size, source_domains, models, clas
     for target_domain, data_loader in data_loaders:
         for batch_idx, (data, label) in enumerate(data_loader):
             data = data.to(device)
+
+            # --- FIX: Apply Resize & Normalize ---
+            data = fix_batch_office_home(data)
+            # -------------------------------------
+
             N = len(data)
             y_vals = label.cpu().detach().numpy()
             one_hot = np.zeros((y_vals.size, C))
@@ -187,6 +200,8 @@ def build_DP_model_Classes(data_loaders, data_size, source_domains, models, clas
             for k, source_domain in enumerate(source_domains):
                 with torch.no_grad():
                     if DATASET_MODE == "OFFICE":
+                        # Ensure eval mode
+                        classifiers[source_domain].eval()
                         features, logits = classifiers[source_domain](data)
                     else:
                         logits = classifiers[source_domain](data)
@@ -220,9 +235,11 @@ def build_DP_model_Classes(data_loaders, data_size, source_domains, models, clas
                 scores_proc = (raw_scores - mean_val) / std_val if std_val > 1e-6 else (raw_scores - mean_val)
 
             if "KDE" in estimate_prob_type:
+                # Dynamic bandwidth
                 score_std = np.std(scores_proc)
-                params = {"bandwidth": np.linspace(0.04, 0.5, 25)} if score_std < 0.05 else {
-                    "bandwidth": np.logspace(-2, 2, 40)}
+                if score_std < 1e-9: score_std = 1.0
+                params = {"bandwidth": np.linspace(score_std / 50.0, score_std / 2.0, 25)}
+
                 subset_idx = np.random.permutation(len(scores_proc))[:3000]
                 grid = GridSearchCV(KernelDensity(), params, n_jobs=1, cv=3)
                 grid.fit(scores_proc[subset_idx])
@@ -231,18 +248,13 @@ def build_DP_model_Classes(data_loaders, data_size, source_domains, models, clas
             else:
                 D[:, :, k] = np.tile(np.exp(-np.abs(scores_proc)), (1, C))
 
-    # --- FIX: SCALING INSTEAD OF GLOBAL NORMALIZATION ---
-    # 1. Mask Weak (Optional - keep to filter noise)
+    # --- SCALING ---
     mask_weak = D < (D.max(axis=2, keepdims=True) * 0.3)
     D[mask_weak] = 0.0
-
-    # 2. Scaling per domain to keep numbers numeric-friendly
-    # Instead of dividing by sum (which becomes huge -> 0), divide by max (becomes 1.0)
     for k in range(len(source_domains)):
         max_val = D[:, :, k].max()
         if max_val > 1e-9:
             D[:, :, k] = D[:, :, k] / max_val
-    # --- END FIX ---
 
     return Y, D, H
 
@@ -256,9 +268,6 @@ def evaluate_accuracy(weights, D, H, Y, multi_dim):
     return accuracy_score(y_true, final.argmax(axis=1)) * 100.0
 
 
-# ==========================================
-# --- NEW DEBUG FUNCTION ---
-# ==========================================
 def debug_matrices(Y, D, H, sources):
     print("\n" + "=" * 40)
     print("   DEBUG: MATRICES SANITY CHECK")
@@ -293,16 +302,9 @@ def debug_matrices(Y, D, H, sources):
         agreement = (preds_0 == preds_1).mean()
         print(f"\n--- 3. Model Agreement ---")
         print(f"   Agreement between {sources[0]} and {sources[1]}: {agreement:.2%}")
-
-    # 4. Normalization Check
-    sums = D.sum(axis=2)  # Sum across sources
-    print(f"\n--- 4. Normalization Check ---")
-    print(f"   Avg Sum across sources (Should be ~1.0): {sums.mean():.4f}")
-
     print("=" * 40 + "\n")
 
 
-# --- FUNCTION TO CALCULATE BASELINES (Oracle, Uniform, DC) ONLY ONCE ---
 def run_baselines(Y, D, H, source_domains, target_domains, seed, init_z_method, multi_dim, all_source_domains):
     output_buffer = io.StringIO()
 
@@ -366,7 +368,6 @@ def run_baselines(Y, D, H, source_domains, target_domains, seed, init_z_method, 
     return output_buffer.getvalue()
 
 
-# --- WORKER: Only runs CVXPY sweep ---
 def run_solver_sweep_worker(Y, D, H, eps_mult, source_domains, target_domains,
                             seed, init_z_method, multi_dim, precomputed_weights,
                             all_source_domains):
@@ -379,13 +380,9 @@ def run_solver_sweep_worker(Y, D, H, eps_mult, source_domains, target_domains,
     K = len(source_domains)
     max_entropy = np.log(K) if K > 1 else 0.0
 
-    # Reduced multipliers list to save time
     multipliers = [1.0, 1.2]
-
-    # Only optimizing solvers here
     solvers = ["CVXPY_GLOBAL", "CVXPY_PER_DOMAIN"]
-
-    SUBSET = 3000  # Increased to 3000 as requested
+    SUBSET = 3000
 
     if len(Y) > SUBSET:
         np.random.seed(seed)
@@ -405,27 +402,22 @@ def run_solver_sweep_worker(Y, D, H, eps_mult, source_domains, target_domains,
             try:
                 delta_vec = np.array([delta_val] * K)
                 if solver == "CVXPY_GLOBAL":
-                    # Using SCS as requested
                     learned_z = solve_convex_problem_mosek(Y_opt, D_opt, H_opt, delta=delta_val, epsilon=eps_global,
                                                            solver_type='SCS')
                 elif solver == "CVXPY_PER_DOMAIN":
-                    # Using SCS as requested
                     learned_z = solve_convex_problem_per_domain(Y_opt, D_opt, H_opt, delta=delta_vec,
                                                                 epsilon=eps_vector, solver_type='SCS')
             except:
                 pass
 
-            # --- UPDATED LOGIC FOR HANDLING NONE / FAILURE ---
             if learned_z is None:
                 status = "Failed"
                 score_disp = "---"
-                # Print failure to console
                 print(f"    >>> [Worker] Eps={eps_mult} | {solver} | Mult={mult} | FAILED")
             else:
                 status = "Converged"
                 acc_val = evaluate_accuracy(learned_z, D, H, Y, multi_dim)
                 score_disp = f"{acc_val:.4f}"
-                # Print success to console
                 print(f"    >>> [Worker] Eps={eps_mult} | {solver} | Mult={mult} | Acc: {acc_val:.2f}%")
 
             results[solver].append({
@@ -476,6 +468,7 @@ def task_run(date, seed, estimate_prob_type, init_z_method, multi_dim,
         try:
             model.load_state_dict(torch.load(paths[0], map_location=torch.device(device)))
             models[domain] = model
+            model.eval()  # Ensure eval
         except Exception as e:
             print(f"[ERROR] Loading model for {domain}: {e}")
             continue
@@ -490,6 +483,11 @@ def task_run(date, seed, estimate_prob_type, init_z_method, multi_dim,
                     for i, (imgs, _) in enumerate(train_loader):
                         if i > 20: break
                         imgs = imgs.to(device)
+
+                        # --- FIX: Apply Resize & Normalize ---
+                        imgs = fix_batch_office_home(imgs)
+                        # -------------------------------------
+
                         feats, _ = extractor(imgs)
                         all_feats.append(feats)
 
@@ -503,7 +501,12 @@ def task_run(date, seed, estimate_prob_type, init_z_method, multi_dim,
                 if i > 50: break
                 with torch.no_grad():
                     imgs = imgs.to(device)
+
                     if DATASET_MODE == "OFFICE":
+                        # --- FIX: Apply Resize & Normalize ---
+                        imgs = fix_batch_office_home(imgs)
+                        # -------------------------------------
+
                         feats, _ = extractor(imgs)
                         min_v, max_v = vae_norm_stats[domain]
                         vae_in = (feats - min_v) / (max_v - min_v + 1e-6)
@@ -522,7 +525,6 @@ def task_run(date, seed, estimate_prob_type, init_z_method, multi_dim,
     filename = f'Sweep_Results_OPTIMIZED_{seed}.txt'
     full_file_path = os.path.join(test_path, filename)
 
-    # --- RESUME LOGIC ---
     completed_mixes = []
     if os.path.exists(full_file_path):
         print(f"[RESUME] Scanning existing file: {full_file_path}")
@@ -535,7 +537,6 @@ def task_run(date, seed, estimate_prob_type, init_z_method, multi_dim,
 
     with open(full_file_path, 'a') as fp:
         log_print(f"Appending to {filename}")
-
         target_sets = []
         n_domains = len(all_source_domains)
         min_r = 2
@@ -546,7 +547,6 @@ def task_run(date, seed, estimate_prob_type, init_z_method, multi_dim,
 
         for target in target_sets:
             target_str = str(target)
-
             if target_str in completed_mixes:
                 print(f"[SKIP] Target {target_str} already done.")
                 continue
@@ -574,20 +574,15 @@ def task_run(date, seed, estimate_prob_type, init_z_method, multi_dim,
                 continue
 
             Y_tr, D_tr, H_tr = Y_ev, D_ev, H_ev
-
-            # >>> INSERTED DEBUG FUNCTION CALL HERE <<<
             debug_matrices(Y_tr, D_tr, H_tr, src)
 
-            # --- STEP 1: CALCULATE BASELINES ONCE ---
             log_print("    -> Calculating Baselines (Oracle, Uniform, DC)...")
             baseline_str = run_baselines(Y_tr, D_tr, H_tr, src, target, seed, init_z_method, multi_dim,
                                          all_source_domains)
             fp.write(baseline_str)
             fp.flush()
 
-            # --- STEP 2: RUN PARALLEL SWEEP (OPTIMIZATION) ---
             log_print(f"    -> Launching parallel solvers for Epsilons [1.0, 1.1, 1.2]")
-
             parallel_results = Parallel(n_jobs=-1, backend="loky")(
                 delayed(run_solver_sweep_worker)(
                     Y_tr, D_tr, H_tr, eps, src, target, seed, init_z_method, multi_dim, None, all_source_domains
@@ -597,47 +592,53 @@ def task_run(date, seed, estimate_prob_type, init_z_method, multi_dim,
             for res_str in parallel_results:
                 fp.write(res_str)
                 fp.write("." * 120 + "\n")
-
             fp.flush()
 
 
 def main():
-    print("device = ", device)
+    print(f"✅ Runtime Device: {device}")
     classifiers = {}
     domains = ALL_DOMAINS_LIST
 
-    print(f"Loading classifiers for {DATASET_MODE}...")
+    print(f"Loading classifiers for {DATASET_MODE} (Optimized)...")
 
     for d in domains:
         try:
             path = f"./classifiers_new/{d}_classifier.pt"
+            if not os.path.exists(path):
+                print(f"❌ [ERROR] File not found: {path}")
+                continue
 
             if DATASET_MODE == "DIGITS":
                 classifier = ClSFR.Grey_32_64_128_gp().to(device)
-                classifier.load_state_dict(
-                    torch.load(path, map_location=torch.device(device)))
+                state = torch.load(path, map_location=device)
+                classifier.load_state_dict(state)
             elif DATASET_MODE == "OFFICE":
                 full_model = models.resnet50(weights=None)
                 full_model.fc = nn.Linear(full_model.fc.in_features, NUM_CLASSES)
-                full_model.load_state_dict(
-                    torch.load(path, map_location=torch.device(device)))
+
+                # Optimized Load
+                state_dict = torch.load(path, map_location=device)
+                full_model.load_state_dict(state_dict)
                 classifier = FeatureExtractor(full_model).to(device)
 
-            if hasattr(classifier, 'eval'):
-                classifier.eval()
+            # --- CRITICAL SAFETY ---
+            classifier.eval()
+            for param in classifier.parameters():
+                param.requires_grad = False
 
             classifiers[d] = classifier
-            print(f"Loaded {d}")
+            print(f"✅ Loaded {d}")
         except Exception as e:
             print(f"[WARNING] Could not load classifier for {d}: {e}")
-            pass
 
     if len(classifiers) == 0:
-        print("[ERROR] No classifiers loaded. Check paths.")
+        print("ERROR: No classifiers loaded.")
         return
 
-    date = '03_01_debug'
+    date = '03_01_FIXED'
     for seed in [1]:
+        print(f"\n--- Starting Run for Seed {seed} ---")
         task_run(date, seed, "OURS-STD-SCORE-WITH-KDE", "err", True, "vrs", 2, -2,
                  classifiers, domains, "per_target", "all_data", True)
     print("Done.")

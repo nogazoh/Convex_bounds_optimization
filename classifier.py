@@ -3,6 +3,7 @@ import os
 import ssl
 from joblib import Parallel, delayed
 
+# Fix for some network environments preventing download of pre-trained weights
 ssl._create_default_https_context = ssl._create_unverified_context
 
 import torch
@@ -12,6 +13,7 @@ import torch.optim as optim
 import numpy as np
 import torchvision.models as models
 
+# Import your data loader file
 import data as Data
 
 
@@ -70,28 +72,31 @@ class Grey_32_64_128_gp(nn.Module):
 
 def build_network(domain):
     """
-    Returns the original Grey model for digits,
-    and a powerful ResNet50 for Office-Home.
+    Returns the appropriate model architecture based on the domain name.
     """
-    # Group A: Digits - Use the original code
+    # Group A: Digits (1 channel, 10 classes)
     if domain in ['MNIST', 'USPS', 'SVHN']:
-        # print(f"--> [Factory] Selected Original Grey Model for {domain}")
         return Grey_32_64_128_gp(n_classes=10)
 
-    # Group B: Office-Home - Use ResNet50
-    else:
-        # print(f"--> [Factory] Selected ResNet-50 (Pretrained) for {domain}")
-        # Load ResNet50 with ImageNet weights
+    # Group B: Office-Home (3 channels, 65 classes)
+    elif domain in ['Art', 'Clipart', 'Product', 'Real World']:
         model = models.resnet50(weights='IMAGENET1K_V1')
-
-        # Office-Home has 65 classes
         n_classes = 65
-
-        # Replace the final layer
         num_ftrs = model.fc.in_features
         model.fc = nn.Linear(num_ftrs, n_classes)
-
         return model
+
+    # Group C: Office-31 (3 channels, 31 classes) -- NEW
+    elif domain in ['amazon', 'dslr', 'webcam']:
+        # Loading ResNet50 pre-trained on ImageNet
+        model = models.resnet50(weights='IMAGENET1K_V1')
+        n_classes = 31  # Specific for Office-31
+        num_ftrs = model.fc.in_features
+        model.fc = nn.Linear(num_ftrs, n_classes)
+        return model
+
+    else:
+        raise ValueError(f"Unknown domain for network factory: {domain}")
 
 
 # --- Training & Testing Loops ---
@@ -155,17 +160,20 @@ def test(network, test_loader):
 
 def run_classifier(domain):
     # 1. Get Data
+    # This will now use the NEW logic in data.py (Saenko split for Office-31)
     train_loader, test_loader, config = Data.get_data_loaders(domain)
 
     # 2. Build Network
     network = build_network(domain).to(Data.device)
 
-    # 3. Configure Hyperparameters per Domain Type
+    # 3. Configure Hyperparameters
+    # Digits usually need higher LR, while Transfer Learning (ResNet) needs lower.
     if domain in ['MNIST', 'USPS', 'SVHN']:
         lr = 0.005
         max_epochs = 200
         use_scheduler = False
     else:
+        # Covers Office-Home AND Office-31
         lr = 0.001
         max_epochs = 50
         use_scheduler = True
@@ -180,7 +188,7 @@ def run_classifier(domain):
     best_acc = 0
     epsilon = 1e-4
 
-    print(f"STARTING TRAIN: {domain} | Max Epochs: {max_epochs} | LR: {lr}")
+    print(f"STARTING TRAIN: {domain} | Max Epochs: {max_epochs} | LR: {lr} | Device: {Data.device}")
 
     for epoch in range(1, max_epochs + 1):
 
@@ -190,6 +198,7 @@ def run_classifier(domain):
         if scheduler:
             scheduler.step()
 
+        # Validation on Test Set (Standard protocol for these benchmarks)
         if epoch % 1 == 0:
             acc = test(network, test_loader)
 
@@ -199,12 +208,14 @@ def run_classifier(domain):
                 torch.save(network.state_dict(), save_path)
                 print(f"*** New Best Model Saved (Acc: {best_acc:.2f}%) ***")
 
+        # Simple convergence check
         if len(train_losses) > 5 and \
                 np.abs(train_losses[-1] - train_losses[-2]) <= epsilon and \
                 np.abs(train_losses[-2] - train_losses[-3]) <= epsilon:
             print("Loss Converged.")
             break
 
+    # If something went wrong and we never saved (e.g. 0 accuracy), save anyway
     if best_acc == 0:
         save_path = f"./classifiers_new/{domain}_classifier.pt"
         torch.save(network.state_dict(), save_path)
@@ -213,7 +224,7 @@ def run_classifier(domain):
     return best_acc
 
 
-# --- Parallel Execution Wrapper (UPDATED) ---
+# --- Parallel Execution Wrapper ---
 
 def parallel_wrapper(domain):
     """
@@ -221,15 +232,11 @@ def parallel_wrapper(domain):
     If model exists -> Loads and Evaluates it.
     If model missing -> Trains it.
     """
-    # torch.set_num_threads(1)
-    # torch.set_num_interop_threads(1)
-
     print(f"--- Process starting for {domain} on PID {os.getpid()} ---")
 
     save_path = f"./classifiers_new/{domain}_classifier.pt"
 
-    # === CHANGE STARTS HERE ===
-    # If the model already exists, we LOAD and TEST it instead of returning 0
+    # If the model already exists, we LOAD and TEST it
     if os.path.exists(save_path):
         print(f"[{domain}] Found existing model at {save_path}. Evaluating...")
 
@@ -250,15 +257,13 @@ def parallel_wrapper(domain):
 
         except Exception as e:
             print(f"[{domain}] Error loading existing model: {e}. Will re-train.")
-            # If loading failed, we fall through to training below
             pass
-    # === CHANGE ENDS HERE ===
 
     # If we are here, either model didn't exist or failed to load
     return run_classifier(domain)
 
 
-# --- New Function: Cross-Domain Evaluation ---
+# --- Cross-Domain Evaluation Matrix ---
 
 def evaluate_cross_domain(domains):
     print("\n" + "#" * 60)
@@ -266,11 +271,9 @@ def evaluate_cross_domain(domains):
     print("#" * 60)
 
     # 1. Pre-load all Test Data Loaders to save time
-    # (Loading data once is faster than reloading it for every model loop)
     print("--> Pre-loading test datasets...")
     test_loaders = {}
     for d in domains:
-        # We only need the test loader
         _, test_loader, _ = Data.get_data_loaders(d)
         test_loaders[d] = test_loader
 
@@ -286,7 +289,7 @@ def evaluate_cross_domain(domains):
         model_path = f"./classifiers_new/{source}_classifier.pt"
 
         if not os.path.exists(model_path):
-            print(f"[WARNING] Model for {source} not found at {model_path}. Skipping.")
+            print(f"[WARNING] Model for {source} not found. Skipping.")
             continue
 
         try:
@@ -314,7 +317,6 @@ def evaluate_cross_domain(domains):
                     correct += preds.eq(lbl).sum().item()
                     total += lbl.size(0)
 
-            # Calculate Error (1 - Accuracy)
             accuracy = correct / total
             error = 1.0 - accuracy
             results_matrix[source][target] = error
@@ -333,35 +335,41 @@ def evaluate_cross_domain(domains):
             if err == -1:
                 row_str += f"{'N/A':<10} | "
             else:
-                # Highlight diagonal (Self-Error) with brackets if you want, or just print
-                row_str += f"{err:.4f}     | "
+                row_str += f"{err:.4f}      | "
         print(row_str)
     print("=" * 80 + "\n")
 
 
-# --- Update Main Block ---
+# --- Main Execution Block ---
 
 if __name__ == '__main__':
-    # ... (Your existing code for creating directories and running parallel jobs) ...
     save_dir = os.path.join(os.path.dirname(__file__), "classifiers_new")
     os.makedirs(save_dir, exist_ok=True)
 
-    office_domains = ['Art', 'Clipart', 'Product', 'Real World']
-    # office_domains = ['MNIST', 'USPS', 'SVHN'] # Use this if creating Digits models
+    # === CONFIGURATION: Choose your dataset ===
 
-    num_jobs = 1 #min(len(office_domains), os.cpu_count() or 1)
+    # CASE 1: Office-31 (Current Task)
+    domains_to_run = ['amazon', 'dslr', 'webcam']
 
-    print(f"Starting parallel execution on {num_jobs} CPU cores...")
+    # CASE 2: Office-Home
+    # domains_to_run = ['Art', 'Clipart', 'Product', 'Real World']
 
-    # This runs the training/testing for each individual model
+    # CASE 3: Digits
+    # domains_to_run = ['MNIST', 'USPS', 'SVHN']
+
+    print(f"Running for domains: {domains_to_run}")
+
+    # 1. Train models (or load if exist)
+    # Using 1 job to avoid GPU memory issues, increase if using CPU only or multiple GPUs
+    num_jobs = 1
+
     results = Parallel(n_jobs=num_jobs, backend="loky")(
-        delayed(parallel_wrapper)(d) for d in office_domains
+        delayed(parallel_wrapper)(d) for d in domains_to_run
     )
 
     print("\n" + "=" * 30)
     print("INDIVIDUAL TRAINING COMPLETED")
     print("=" * 30)
 
-    # === NEW: Run the Cross-Domain Matrix Evaluation ===
-    # This runs sequentially in the main process to avoid GPU memory conflicts
-    evaluate_cross_domain(office_domains)
+    # 2. Evaluate Matrix (Cross-Domain)
+    evaluate_cross_domain(domains_to_run)
