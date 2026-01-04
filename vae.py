@@ -1,5 +1,5 @@
 import torch
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, Subset
 from joblib import Parallel, delayed
 import ssl
 import os
@@ -7,28 +7,27 @@ import numpy as np
 from torch import nn, optim
 from torch.distributions.normal import Normal
 from torch.distributions.multinomial import Multinomial
-import matplotlib.pyplot as plt
 import datetime
 import torch.nn.functional as F
-from torchvision import models
+from torchvision import models, transforms
 
-# Assuming 'data.py' is in the same directory for loading raw images during extraction
+# Import your data loader file
 import data as Data
 
 # Bypass SSL verification for dataset downloads if needed
 ssl._create_default_https_context = ssl._create_unverified_context
 
+# --- Device Configuration ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("device = ", device)
+print(f"VAE running on: {device}")
 
 # Determine number of parallel jobs
-N_JOBS = 2
+# Keep it 1 for stability when using GPU feature extraction
+N_JOBS = 1
 
 
 def configure_per_process_threads():
-    """
-    Limit threads per process to prevent CPU oversubscription during parallel runs.
-    """
+    """Limit threads per process to prevent CPU oversubscription."""
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
     try:
@@ -46,6 +45,7 @@ def extract_features_if_needed(domain):
     """
     Checks if feature files exist. If not, loads the pre-trained classifier,
     extracts features (penultimate layer), and saves them to disk.
+    Forces 'Clean' transforms (CenterCrop) even for training data.
     """
     save_dir = f"./data_features/{domain}"
     train_save_path = os.path.join(save_dir, "train.pt")
@@ -58,27 +58,30 @@ def extract_features_if_needed(domain):
     print(f"\n[EXTRACTION] Features for '{domain}' not found. Extracting from classifier...")
     os.makedirs(save_dir, exist_ok=True)
 
-    # 1. Define Model Structure (ResNet50 with 65 classes for Office-Home)
-    OFFICE_HOME_CLASSES = 65
+    # --- 1. Detect Classes based on Domain ---
+    OFFICE_31_DOMAINS = ['amazon', 'dslr', 'webcam']
+
+    if domain in OFFICE_31_DOMAINS:
+        num_classes = 31
+        print(f"   -> Detected Office-31 domain (Classes: {num_classes})")
+    else:
+        num_classes = 65  # Default to Office-Home
+        print(f"   -> Detected Office-Home domain (Classes: {num_classes})")
+
+    # Load ResNet architecture
     model = models.resnet50(weights=None)
-    model.fc = nn.Linear(model.fc.in_features, OFFICE_HOME_CLASSES)
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
 
     # 2. Load Your Pre-trained Weights
-    # Based on your screenshot, the folder is "classifiers_new"
     model_path = f"./classifiers_new/{domain}_classifier.pt"
 
     if not os.path.exists(model_path):
-        # Fallback: try looking in current dir just in case
-        if os.path.exists(f"{domain}_classifier.pt"):
-            model_path = f"{domain}_classifier.pt"
-        else:
-            raise FileNotFoundError(f"[CRITICAL] Classifier model not found at: {model_path}\n"
-                                    f"Cannot extract features without the source model.")
+        raise FileNotFoundError(f"[CRITICAL] Classifier model not found at: {model_path}\n"
+                                f"Please run classifier.py first for this domain.")
 
-    # Load weights
     try:
-        # map_location ensures it loads on CPU if CUDA is not available
         model.load_state_dict(torch.load(model_path, map_location=device))
+        print(f"   -> Loaded weights from {model_path}")
     except Exception as e:
         print(f"[ERROR] Failed to load weights for {domain}: {e}")
         raise e
@@ -88,33 +91,51 @@ def extract_features_if_needed(domain):
     model = model.to(device)
     model.eval()
 
-    # 4. Helper to process a loader and save
+    # 4. Get Data Loaders
+    print(f"   -> Loading raw images for {domain}...")
+    train_loader, test_loader, config = Data.get_data_loaders(domain)
+
+    # --- CRITICAL FIX: FORCE CLEAN TRANSFORM FOR TRAIN SET ---
+    # data.py now uses Aggressive Augmentation (RandomCrop) for training.
+    # For VAE feature extraction, we want stable, canonical features (CenterCrop).
+    # We swap the transform of the underlying dataset on the fly.
+
+    target_size = config['size']
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+
+    clean_transform = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.CenterCrop(target_size),
+        transforms.ToTensor(),
+        normalize
+    ])
+
+    # Hack to swap transform in the Subset's underlying dataset
+    # This ensures the VAE learns from clean images, not cropped/flipped ones
+    if isinstance(train_loader.dataset, Subset):
+        print("   -> Overriding Train transforms to 'Clean' (CenterCrop) for extraction...")
+        # We access the underlying dataset and replace the transform
+        train_loader.dataset.dataset.transform = clean_transform
+
+    # 5. Helper to process and save
     def process_and_save(loader, save_path):
         features_list = []
         labels_list = []
 
+        if loader is None: return
+
+        print(f"   -> Processing {len(loader.dataset)} images...")
         with torch.no_grad():
             for batch_idx, (imgs, labels) in enumerate(loader):
                 imgs = imgs.to(device)
-
-                # Pass through ResNet backbone
                 feats = model(imgs)
-
                 features_list.append(feats.cpu())
                 labels_list.append(labels.cpu())
 
-        # Concatenate all batches
         all_feats = torch.cat(features_list, dim=0)
         all_labels = torch.cat(labels_list, dim=0)
-
-        # Save to disk
         torch.save((all_feats, all_labels), save_path)
         print(f"   -> Saved to {save_path} (Shape: {all_feats.shape})")
-
-    # 5. Load Raw Images using data.py and Process
-    print(f"   -> Loading raw images for {domain}...")
-    # Note: data.py usually returns (train, test, val) or (train, test). Adjust unpacking if needed.
-    train_loader, test_loader, _ = Data.get_data_loaders(domain)
 
     process_and_save(train_loader, train_save_path)
     process_and_save(test_loader, test_save_path)
@@ -123,47 +144,38 @@ def extract_features_if_needed(domain):
 
 def load_feature_dataset(domain, batch_size=32):
     """
-    Loads pre-extracted ResNet features from .pt files.
+    Loads pre-extracted ResNet features.
     Normalizes features to [0, 1] for BCE loss compatibility.
     """
-    # Ensure features exist before loading
     extract_features_if_needed(domain)
 
     feature_dir = f"./data_features/{domain}"
     train_path = os.path.join(feature_dir, "train.pt")
     test_path = os.path.join(feature_dir, "test.pt")
 
-    # Load Tensors
     train_features, train_labels = torch.load(train_path)
     test_features, test_labels = torch.load(test_path)
 
     # --- NORMALIZATION [0, 1] ---
-    # Essential because VAE output is Sigmoid (0-1) and Loss is BCE.
     min_val = train_features.min()
     max_val = train_features.max()
+    denom = max_val - min_val
+    if denom == 0: denom = 1e-6
 
-    # Normalize Train
-    train_features = (train_features - min_val) / (max_val - min_val + 1e-6)
+    train_features = (train_features - min_val) / denom
+    test_features = (test_features - min_val) / denom
 
-    # Normalize Test (using Train stats)
-    test_features = (test_features - min_val) / (max_val - min_val + 1e-6)
-
-    # *** FIX: CLAMP VALUES TO [0, 1] ***
-    # This prevents the "RuntimeError: all elements of target should be between 0 and 1"
-    # if test data has outliers outside the training min/max range.
+    # Clamp to ensure strict [0, 1]
     train_features = torch.clamp(train_features, 0.0, 1.0)
     test_features = torch.clamp(test_features, 0.0, 1.0)
 
-    # Create DataLoaders
     train_dataset = TensorDataset(train_features, train_labels)
     test_dataset = TensorDataset(test_features, test_labels)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-    # Input dimension (should be 2048 for ResNet50)
     input_dim = train_features.shape[1]
-
     return train_loader, test_loader, input_dim
 
 
@@ -224,8 +236,11 @@ def compute_approximation_for_negative_alpha(log_w_matrix, alpha):
     min_val = norm_log_w_matrix.min(1, keepdim=True)[0]
     max_val = norm_log_w_matrix.max(1, keepdim=True)[0]
 
+    denom = max_val - min_val
+    denom[denom == 0] = 1e-6
+
     norm_log_w_matrix -= min_val
-    norm_log_w_matrix /= max_val
+    norm_log_w_matrix /= denom
     norm_w_matrix = torch.exp(norm_log_w_matrix)
 
     approx = norm_w_matrix - 1
@@ -251,7 +266,6 @@ class vr_model(nn.Module):
     def __init__(self, input_dim, alpha_pos, alpha_neg):
         super(vr_model, self).__init__()
         self.input_dim = input_dim
-        # Features are ~2048 dims, so 512 is a good latent/hidden size
         hidden_dim = 200 if input_dim < 1000 else 512
 
         self.fc1 = nn.Linear(input_dim, hidden_dim)
@@ -301,7 +315,6 @@ class vr_model(nn.Module):
 
     def compute_log_probabitility_bernoulli(self, obs, p, axis=1):
         epsilon = 1e-10
-        # Ensure p is clamped just in case, though it comes from dataset
         p = torch.clamp(p, 0.0, 1.0)
         return torch.sum(p * torch.log(obs + epsilon) + (1 - p) * torch.log(1 - obs + epsilon), axis)
 
@@ -349,19 +362,15 @@ def train(model, optimizer, epoch, train_loader, model_type, losses, recon_losse
     for batch_idx, (data, _) in enumerate(train_loader):
         data = data.to(device)
         optimizer.zero_grad()
-
         loss, recon_loss_MSE, recon_loss_CE, log_p = model.compute_loss_for_batch(data, model, model_type, K=20)
         loss.backward()
-
         train_loss += loss.item()
         train_recon_loss_MSE += recon_loss_MSE.item()
         train_recon_loss_CE += recon_loss_CE.item()
         train_log_p += log_p.item()
-
         optimizer.step()
 
     print('====> Epoch: {} Average loss: {:.4f}'.format(epoch, train_loss / len(train_loader.dataset)))
-
     losses.append(train_loss / len(train_loader.dataset))
     recon_losses.append((train_recon_loss_MSE / len(train_loader.dataset),
                          train_recon_loss_CE / len(train_loader.dataset)))
@@ -379,11 +388,9 @@ def test(model, epoch, test_loader, model_type, losses, recon_losses, log_p_vals
     with torch.no_grad():
         for i, (data, _) in enumerate(test_loader):
             data = data.to(device)
-
             loss, recon_loss_MSE, recon_loss_CE, log_p = model.compute_loss_for_batch(
                 data, model, model_type, K=20, testing_mode=True
             )
-
             test_loss += loss.item()
             test_recon_loss_MSE += recon_loss_MSE.item()
             test_recon_loss_CE += recon_loss_CE.item()
@@ -408,7 +415,6 @@ def run(model_type, alpha_pos, alpha_neg, data_name, seed):
     learning_rate = 0.001
     testing_frequency = 1
 
-    # Folder for results
     path = f"./models_{data_name}_seed{seed}_density_features"
     os.makedirs(path, exist_ok=True)
 
@@ -421,7 +427,6 @@ def run(model_type, alpha_pos, alpha_neg, data_name, seed):
 
     print(f"[START] {filename_prefix}")
 
-    # Load Features
     try:
         train_loader, test_loader, input_dim = load_feature_dataset(data_name)
     except Exception as e:
@@ -443,13 +448,10 @@ def run(model_type, alpha_pos, alpha_neg, data_name, seed):
     testing_cnt = 0
 
     while True:
-        if epoch > 200:
-            break
-
+        if epoch > 200: break
         if testing_cnt >= 3 and test_losses[-1] >= test_losses[-2] and test_losses[-2] >= test_losses[-3]:
             print("Early stopping: Test loss increased 3 times.")
             break
-
         if len(train_losses) >= 5 and \
                 np.abs(train_losses[-1] - train_losses[-2]) <= eps and \
                 np.abs(train_losses[-2] - train_losses[-3]) <= eps:
@@ -457,14 +459,12 @@ def run(model_type, alpha_pos, alpha_neg, data_name, seed):
             break
 
         train_losses, train_recon_losses, train_log_p_vals = train(
-            model, optimizer, epoch, train_loader,
-            model_type, train_losses, train_recon_losses, train_log_p_vals
+            model, optimizer, epoch, train_loader, model_type, train_losses, train_recon_losses, train_log_p_vals
         )
 
         if epoch % testing_frequency == 0:
             test_losses, test_recon_losses, test_log_p_vals = test(
-                model, epoch, test_loader,
-                model_type, test_losses, test_recon_losses, test_log_p_vals,
+                model, epoch, test_loader, model_type, test_losses, test_recon_losses, test_log_p_vals,
                 img_shape=(1, 1, input_dim)
             )
             testing_cnt += 1
@@ -474,22 +474,16 @@ def run(model_type, alpha_pos, alpha_neg, data_name, seed):
     print(datetime.datetime.now())
     print(f"[DONE] {filename_prefix}")
 
-    # Save
     torch.save(train_losses, os.path.join(path, f"{filename_prefix}_train_losses.pt"))
-    torch.save(train_recon_losses, os.path.join(path, f"{filename_prefix}_train_recon_losses.pt"))
-    torch.save(train_log_p_vals, os.path.join(path, f"{filename_prefix}_train_log_p_vals.pt"))
     torch.save(test_losses, os.path.join(path, f"{filename_prefix}_test_losses.pt"))
-    torch.save(test_recon_losses, os.path.join(path, f"{filename_prefix}_test_recon_losses.pt"))
-    torch.save(test_log_p_vals, os.path.join(path, f"{filename_prefix}_test_log_p_vals.pt"))
     torch.save(model.state_dict(), model_file_path)
 
 
 def run_all():
     configure_per_process_threads()
 
-    domains = [
-        'Art', 'Clipart', 'Product', 'Real World'
-    ]
+    # --- Active Domains: Office-31 ---
+    domains = ['amazon', 'dslr', 'webcam']
 
     seeds = [1]
     tasks = [(domain, seed) for domain in domains for seed in seeds]
@@ -497,24 +491,14 @@ def run_all():
     def wrapped_run(domain, seed):
         torch.manual_seed(seed)
         run('vae', alpha_pos=1, alpha_neg=-1, data_name=domain, seed=seed)
-        # run('vr', alpha_pos=2, alpha_neg=-1, data_name=domain, seed=seed)
-        # run('vr', alpha_pos=0.5, alpha_neg=-1, data_name=domain, seed=seed)
-        # run('vr', alpha_pos=5, alpha_neg=-1, data_name=domain, seed=seed)
         run('vrs', alpha_pos=0.5, alpha_neg=-0.5, data_name=domain, seed=seed)
         run('vrs', alpha_pos=2, alpha_neg=-2, data_name=domain, seed=seed)
-        # run('vrlu', alpha_pos=0.5, alpha_neg=-0.5, data_name=domain, seed=seed)
-        # --- Active Configurations (Sandwich Bounds) ---
-        # run('vrs', alpha_pos=2, alpha_neg=-0.5, data_name=domain, seed=seed)
-        # run('vrs', alpha_pos=0.5, alpha_neg=-2, data_name=domain, seed=seed)
 
     print(f"Starting parallel training on {N_JOBS} cores...")
 
-    Parallel(
-        n_jobs=N_JOBS,
-        backend="loky",
-        prefer="processes",
-        batch_size=1
-    )([delayed(wrapped_run)(domain, seed) for domain, seed in tasks])
+    Parallel(n_jobs=N_JOBS, backend="loky", prefer="processes", batch_size=1)(
+        delayed(wrapped_run)(domain, seed) for domain, seed in tasks
+    )
 
 
 if __name__ == "__main__":
