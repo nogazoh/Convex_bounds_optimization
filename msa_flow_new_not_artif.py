@@ -20,12 +20,15 @@ except ImportError:
     print("[WARNING] DC solver (dc.py) not found in current path.")
     pass
 
+from cvxpy_solver import solve_convex_problem_mosek   # <<< P3.10
+
+
 # ==========================================
 # --- CONFIGURATION ---
 # ==========================================
 ROOT_DIR = "/data/nogaz/Convex_bounds_optimization/LatentFlow_Pixel_Experiments"
 OFFICE_DIR = "/data/nogaz/Convex_bounds_optimization/Office-31"
-D_MATRIX_NAME = "D_Matrix_LatentFlow_T8.npy"
+D_MATRIX_NAME = "D_Matrix_LatentFlow.npy"
 D_MATRIX_PATH = os.path.join(ROOT_DIR, "results", D_MATRIX_NAME)
 RESULTS_DIR = os.path.join(ROOT_DIR, "Results_MSA")
 os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -42,10 +45,9 @@ TARGET_RATIOS = {
     ('amazon', 'dslr', 'webcam'): {'amazon': 0.33, 'dslr': 0.33, 'webcam': 0.34}
 }
 
-print(f"==================================================")
-print(f"Running MSA Solver Optimization (Specific Solvers 3.21/3.22/3.23)")
-print(f"==================================================")
-
+print("=" * 80)
+print("Running MSA Comparison: Problems 3.10 / 3.21 / 3.22 / 3.23")
+print("=" * 80)
 
 # ============================================================
 # SHARED HELPERS FOR SOLVERS
@@ -414,26 +416,75 @@ def evaluate_accuracy(w, D, H, Y):
 def run_cvxpy_smoothed_loop(Y, D, H, target_list):
     buf = io.StringIO()
 
-    solvers = [
+    # --------------------------------------------------
+    # Solvers 3.21 / 3.22 / 3.23 (with eta)
+    # --------------------------------------------------
+    smoothed_solvers = [
         ("P3.21", solve_convex_problem_smoothed_kl),
         ("P3.22", solve_convex_problem_domain_anchored_smoothed),
         ("P3.23", solve_convex_problem_smoothed_original_p),
     ]
 
-    eps_multipliers = [1.5, 2.0, 4, 7, 10, 20, 30, 50, 60]
-    eta_values = [5e-4, 5e-3, 1e-2, 0.1, 0.2, 0.5, 0.8, 1, 3, 6]
+    eps_multipliers = [1.5, 2.0, 4, 7, 10, 20, 30, 50]
+    eta_values = [5e-4, 5e-3, 1e-2, 0.1, 0.2, 0.5, 0.8, 1]
 
     for eps_mult in eps_multipliers:
-        # errors = np.array([(SOURCE_ERRORS.get(d, 0.1) + 0.05) * eps_mult for d in target_list])
         epsilon_vec = np.array([
             (SOURCE_ERRORS[d] + 0.05) * eps_mult
             for d in target_list
         ])
+
         eps_str = ", ".join(
             [f"{d}:{epsilon_vec[i]:.4f}" for i, d in enumerate(target_list)]
         )
+
+        # ======================================================
+        # Problem 3.10 (NO eta)
+        # ======================================================
+        deltas = [1e-2, 0.1, 0.5, 0.7, 1, 2, 1000]
+        for delta in deltas:
+            print(
+                f" [CVXPY] P3.10 | "
+                f"EpsMult: {eps_mult} | "
+                f"Epsilon: [{eps_str}]"
+                f"delta: {delta}"
+            )
+
+            try:
+                w_310 = solve_convex_problem_mosek(
+                    Y, D, H,
+                    delta=delta,
+                    epsilon=epsilon_vec,
+                    solver_type='SCS'
+                )
+
+                if w_310 is not None:
+                    acc = evaluate_accuracy(w_310, D, H, Y)
+                    w_str = ", ".join([f"{val:.3f}" for val in w_310])
+                    msg = (
+                        f"{'P3.10':<6} | "
+                        f"eps:[{eps_str}] | "
+                        f"delta:{delta:<8} | "
+                        f"Acc:{acc:6.2f}% | "
+                        f"w:[{w_str}]"
+                    )
+                    print(f" >>> SUCCESS: {msg}")
+                    buf.write(msg + "\n")
+                else:
+                    buf.write(
+                        f"{'P3.10':<6} | eps:[{eps_str}] | delta:{delta:<8} | INFEASIBLE\n"
+                    )
+
+            except Exception as e:
+                buf.write(
+                    f"{'P3.10':<6} | eps:[{eps_str}] | ERR: {str(e)[:50]}\n"
+                )
+
+        # ======================================================
+        # Problems 3.21 / 3.22 / 3.23 (WITH eta)
+        # ======================================================
         for eta in eta_values:
-            for solver_name, solver_fn in solvers:
+            for solver_name, solver_fn in smoothed_solvers:
                 print(
                     f" [CVXPY] {solver_name} | "
                     f"EpsMult: {eps_mult} | "
@@ -442,7 +493,13 @@ def run_cvxpy_smoothed_loop(Y, D, H, target_list):
                 )
 
                 try:
-                    w, _Q = solver_fn(Y, D, H, epsilon=epsilon_vec, eta=eta, solver_type='SCS')
+                    w, _Q = solver_fn(
+                        Y, D, H,
+                        epsilon=epsilon_vec,
+                        eta=eta,
+                        solver_type='SCS'
+                    )
+
                     if w is not None:
                         acc = evaluate_accuracy(w, D, H, Y)
                         w_str = ", ".join([f"{val:.3f}" for val in w])
@@ -457,9 +514,16 @@ def run_cvxpy_smoothed_loop(Y, D, H, target_list):
                         print(f" >>> SUCCESS: {msg}")
                         buf.write(msg + "\n")
                     else:
-                        buf.write(f"{solver_name:<6} | e:{eps_str:<4} | eta:{eta:<8g} | INFEASIBLE\n")
+                        buf.write(
+                            f"{solver_name:<6} | eps:[{eps_str}] | "
+                            f"eta:{eta:<8g} | INFEASIBLE\n"
+                        )
+
                 except Exception as e:
-                    buf.write(f"{solver_name:<6} | e:{eps_str} | ERR: {str(e)[:50]}\n")
+                    buf.write(
+                        f"{solver_name:<6} | eps:[{eps_str}] | "
+                        f"ERR: {str(e)[:50]}\n"
+                    )
 
     return buf.getvalue()
 
@@ -508,7 +572,7 @@ def main():
 
     results_path = os.path.join(
         RESULTS_DIR,
-        "Results_MSA_LatentFlow_LODO_RealTargets_3.21_3.22_3.23_T8_LODO.txt"
+        "RealTargets_all_solvers_LODO.txt"
     )
 
     with open(results_path, "w") as fp:
@@ -541,13 +605,6 @@ def main():
             Y_sub = Global_Y[row_indices]
             D_sub = Global_D[row_indices][:, source_col_indices]
             H_sub = Global_H[row_indices][:, :, source_col_indices]
-
-            # ----------------------------------
-            # 2. Normalize D row-wise (p(j | x))
-            # ----------------------------------
-            # row_sums = D_sub.sum(axis=1, keepdims=True)
-            # row_sums[row_sums == 0] = 1.0
-            # D_sub = D_sub / row_sums
 
             # ----------------------------------
             # 3. Oracle = true source proportions
