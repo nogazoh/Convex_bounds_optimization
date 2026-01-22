@@ -4,110 +4,129 @@ import numpy as np
 
 def calculate_expected_loss(Y, H, D, num_sources):
     """
-    Calculates the expected loss matrix L[j, t].
+    Computes L_mat[j,t] = E_{i ~ p_t} [loss_j(i)]
+    Assumes columns of D are normalized (sum_i p_{it} = 1)
     """
-    L_mat = np.zeros((num_sources, num_sources))  # (hypothesis j, domain t)
+    L_mat = np.zeros((num_sources, num_sources))
 
     for j in range(num_sources):
-        # Loss calculation (Absolute Error)
-        loss_vec = np.abs(H[:, j] - Y)
+        # loss per sample
+        if H.ndim == 3:
+            loss_vec = np.abs(H[:, :, j] - Y)
+        else:
+            loss_vec = np.abs(H[:, j] - Y)
+
+        if loss_vec.ndim == 2:
+            loss_vec = np.sum(loss_vec, axis=1) / 2.0
 
         for t in range(num_sources):
             p_t = D[:, t]
-            # Expected loss: weighted sum
-            expected_loss = np.sum(p_t * loss_vec)
-            L_mat[j, t] = expected_loss
+            L_mat[j, t] = np.sum(p_t * loss_vec)
 
     return L_mat
 
 
-def solve_convex_problem_mosek(Y, D, H, delta=1e-2, epsilon=1e-2, solver_type='SCS'):
-    """
-    Solves the convex optimization problem using the specified solver.
-    Returns weights w if successful, or None if infeasible/failed.
-    """
+def solve_convex_problem_mosek(
+    Y, D, H,
+    delta=1e-2,
+    epsilon=1e-2, L_mat=None,
+    solver_type='SCS',
 
-    # --- STEP 1: Handle Shapes ---
+):
+    # --------------------------------------------------
+    # Shape handling
+    # --------------------------------------------------
     if D.ndim == 3:
-        N_orig, C, k = D.shape
-        D_flat = D.reshape(-1, k)
-        H_flat = H.reshape(-1, k)
-        Y_flat = Y.reshape(-1)
-        D = D_flat
-        H = H_flat
-        Y = Y_flat
-    else:
-        N, k = D.shape
+        D = D.reshape(-1, D.shape[2])
 
     N, k = D.shape
 
-    # --- STEP 2: Setup Problem ---
-    L_mat = calculate_expected_loss(Y, H, D, k)
+    # --------------------------------------------------
+    # 🔧 CRITICAL FIX: normalize D to probabilities
+    # --------------------------------------------------
+    col_sums = D.sum(axis=0, keepdims=True)
+    col_sums[col_sums == 0] = 1.0
+    D = D / col_sums   # now sum_i D[i,t] = 1
 
+    # --------------------------------------------------
+    # Expected loss
+    # --------------------------------------------------
+    # L_mat = calculate_expected_loss(Y, H, D, k)
+
+    # --------------------------------------------------
+    # Variables
+    # --------------------------------------------------
     w = cp.Variable(k, nonneg=True, name='w')
     Q = cp.Variable((N, k), nonneg=True, name='Q')
     R = cp.Variable((k, k), nonneg=True, name='R')
 
-    # Objective
+    # --------------------------------------------------
+    # Objective:
+    # sum_{i,j} w_j p_{ij} log(q_{ij} / w_j)
+    # --------------------------------------------------
     obj_terms = []
     for j in range(k):
-        term = cp.sum(cp.multiply(D[:, j], -cp.rel_entr(w[j], Q[:, j])))
-        obj_terms.append(term)
+        obj_terms.append(
+            cp.sum(cp.multiply(D[:, j], -cp.rel_entr(w[j], Q[:, j])))
+        )
 
     objective = cp.Maximize(cp.sum(obj_terms))
 
+    # --------------------------------------------------
     # Constraints
-    constraints = []
-    constraints.append(cp.sum(w) == 1)
-    constraints.append(cp.sum(Q, axis=1) == 1)
-    constraints.append(cp.sum(R, axis=0) == 1)
+    # --------------------------------------------------
+    constraints = [
+        cp.sum(w) == 1,
+        cp.sum(Q, axis=1) == 1,
+        cp.sum(R, axis=0) == 1,
+    ]
 
-    # KL Constraint
+    # --------------------------------------------------
+    # KL constraint:
+    # (1/k) * sum_t sum_i p_it sum_j r_jt log(r_jt / q_ij) <= delta
+    # --------------------------------------------------
     kl_terms = []
     for t in range(k):
-        p_t = D[:, t]
-        inner_sum_terms = []
+        p_t = D[:, t]  # already normalized
+        inner = []
         for j in range(k):
             re = cp.rel_entr(R[j, t], Q[:, j])
-            weighted_re = cp.multiply(p_t, re)
-            inner_sum_terms.append(cp.sum(weighted_re))
-        kl_terms.append(cp.sum(inner_sum_terms))
+            inner.append(cp.sum(cp.multiply(p_t, re)))
+        kl_terms.append(cp.sum(inner))
 
     constraints.append((1.0 / k) * cp.sum(kl_terms) <= delta)
 
-    # Loss Constraint
-    for t in range(k):
-        constraints.append(cp.sum(cp.multiply(R[:, t], L_mat[:, t])) <= epsilon)
+    # --------------------------------------------------
+    # Loss constraints:
+    # sum_j r_jt L_j^t <= epsilon
+    # --------------------------------------------------
+    if isinstance(epsilon, (list, np.ndarray)):
+        for t in range(k):
+            constraints.append(
+                cp.sum(cp.multiply(R[:, t], L_mat[:, t])) <= epsilon[t]
+            )
+    else:
+        for t in range(k):
+            constraints.append(
+                cp.sum(cp.multiply(R[:, t], L_mat[:, t])) <= epsilon
+            )
 
-    # --- STEP 3: Solve with Selected Solver ---
+    # --------------------------------------------------
+    # Solve
+    # --------------------------------------------------
     prob = cp.Problem(objective, constraints)
 
-    # PRINT 1: Notification that the solver is starting
-    print(f"   >>> [CVXPY] Starting {solver_type} solve (N={N}, k={k})...")
-
     try:
-        if solver_type == 'SCS':
-            prob.solve(solver=cp.SCS, verbose=False, eps=1e-3, max_iters=5000)
-
-        elif solver_type == 'MOSEK':
-            prob.solve(solver=cp.MOSEK, verbose=False)
-
-        elif solver_type == 'CLARABEL':
-            prob.solve(solver=cp.CLARABEL, verbose=False)
-
-        else:
-            print(f"   !!! Unknown solver {solver_type}, defaulting to SCS")
-            prob.solve(solver=cp.SCS, verbose=False, eps=1e-3)
-
-    except Exception as e:
-        print(f"   !!! Solver Exception: {e}")
+        prob.solve(
+            solver=cp.SCS,
+            verbose=False,
+            eps=1e-4,
+            max_iters=10000
+        )
+    except Exception:
         return None
 
-    # Check status
     if prob.status not in ["optimal", "optimal_inaccurate"]:
-        print(f"   !!! [CVXPY] Failed/Infeasible. Status: {prob.status}")
         return None
 
-    # PRINT 2: Notification of success and the weights found
-    print(f"   >>> [CVXPY] Solved! Weights: {np.round(w.value, 3)}")
     return w.value

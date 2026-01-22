@@ -20,22 +20,22 @@ except ImportError:
     print("[WARNING] DC solver (dc.py) not found in current path.")
     pass
 
-from cvxpy_solver import solve_convex_problem_mosek   # <<< P3.10
-
+from cvxpy_solver import solve_convex_problem_mosek  # <<< P3.10
 
 # ==========================================
 # --- CONFIGURATION ---
 # ==========================================
 ROOT_DIR = "/data/nogaz/Convex_bounds_optimization/LatentFlow_Pixel_Experiments"
 OFFICE_DIR = "/data/nogaz/Convex_bounds_optimization/Office-31"
-D_MATRIX_NAME = "D_Matrix_LatentFlow_T8_global.npy"
-D_MATRIX_PATH = "/data/nogaz/Convex_bounds_optimization/VAE_Renyi_Experiments/Layer4_UMAP/D_Matrix_Layer4.npy" #os.path.join(ROOT_DIR, "results", D_MATRIX_NAME)
+D_MATRIX_NAME = "D_Matrix_LatentFlow_T8.npy"
+D_MATRIX_PATH = os.path.join(ROOT_DIR, "results", D_MATRIX_NAME)
 RESULTS_DIR = os.path.join(ROOT_DIR, "Results_MSA")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 DOMAINS = ['amazon', 'dslr', 'webcam']
 NUM_CLASSES = 31
-SOURCE_ERRORS = {'amazon': 0.1352, 'dslr': 0.0178, 'webcam': 0.0225}
+# Note: These single values are used for epsilon vectors construction
+SOURCE_ERRORS = {'amazon': 0.138, 'dslr': 0.0178, 'webcam': 0.024}
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 TARGET_RATIOS = {
@@ -57,10 +57,10 @@ FULL_L_MAT = np.array([
 # Global variable to track which domains are currently active in the loop
 CURRENT_ACTIVE_DOMAINS = []
 
+print("=" * 80)
+print("Running MSA Comparison: Problems 3.10 / 3.21 / 3.22 / 3.23 (Fixed Loss Matrix)")
+print("=" * 80)
 
-print("=" * 80)
-print("Running MSA Comparison: Problems 3.10 / 3.21 / 3.22 / 3.23")
-print("=" * 80)
 
 # ============================================================
 # SHARED HELPERS FOR SOLVERS
@@ -110,8 +110,8 @@ def calculate_expected_loss(Y, H, D, num_sources, eps=1e-12):
         L_mat = np.zeros((num_sources, num_sources))
 
     # Sanity Prints
-    # k = num_sources
-    # w_unif = np.ones(k) / k
+    k = num_sources
+    w_unif = np.ones(k) / k
     # print("[SANITY - FIXED] L_mat range:", L_mat.min(), L_mat.max())
     # print("[SANITY - FIXED] max_t (w_unif @ L_mat[:,t]) =", np.max(w_unif @ L_mat))
 
@@ -129,8 +129,6 @@ def compute_p_tilde(D, eps=1e-15):
 # ============================================================
 def solve_convex_problem_smoothed_kl(Y, D, H, epsilon=1e-2, eta=1e-2, solver_type="SCS",
                                      q_min=1e-12, w_min=1e-12, scs_eps=1e-4, scs_max_iters=20000):
-    # Pre-processing to avoid logic errors with shapes
-    # If D is (N, K) and H is (N, C, K), we handle loss calculation carefully above.
     N, k = D.shape
     L_mat = calculate_expected_loss(Y, H, D, k)
 
@@ -159,7 +157,6 @@ def solve_convex_problem_smoothed_kl(Y, D, H, epsilon=1e-2, eta=1e-2, solver_typ
 
     prob = cp.Problem(objective, constraints)
 
-    # Solvers
     try:
         if solver_type == "SCS":
             prob.solve(solver=cp.SCS, verbose=False, eps=scs_eps, max_iters=scs_max_iters)
@@ -173,12 +170,6 @@ def solve_convex_problem_smoothed_kl(Y, D, H, epsilon=1e-2, eta=1e-2, solver_typ
     if prob.status not in ["optimal", "optimal_inaccurate"]:
         return None, None
 
-    q_std = np.std(Q.value[:, 0])
-    print(f" [DEBUG] Q Variation (Std): {q_std:.4f}")
-    if q_std < 0.01:
-        print(" [WARNING] Q is flat! The solver is treating all images the same.")
-    else:
-        print(" [OK] Q is adapting per image!")
     return np.asarray(w.value).reshape(-1), np.asarray(Q.value)
 
 
@@ -194,8 +185,7 @@ def solve_convex_problem_domain_anchored_smoothed(Y, D, H, epsilon=1e-2, eta=1e-
     else:
         D_norm = D
 
-    L_mat = calculate_expected_loss(Y, H, D, k)  # Use original D for loss weighting usually? Or normalized?
-    # Using D as per your snippet logic where D was passed in.
+    L_mat = calculate_expected_loss(Y, H, D, k)
 
     p_tilde = compute_p_tilde(D, eps=ptilde_eps)
 
@@ -329,6 +319,10 @@ def load_data_and_compute_matrices():
         if os.path.exists(path):
             state = torch.load(path, map_location=device, weights_only=True)
             m.load_state_dict(state)
+            print("!!!!!!!!!!!!!!!!!!!!")
+            w_sum = m.conv1.weight.data.sum().item()
+            print(f" [DEBUG] {d} conv1 weight sum: {w_sum:.6f}")
+            print("!!!!!!!!!!!!!!!!!!!!")
             classifiers[d] = m.to(device).eval()
 
     Y_list = []
@@ -380,7 +374,6 @@ def load_data_and_compute_matrices():
 
 
 def slice_matrices_with_ratios(target_domains, Global_D, Global_Y, Global_H, domain_ranges):
-    # (Same as before)
     avail_sizes = {d: domain_ranges[d][1] - domain_ranges[d][0] for d in target_domains}
     counts = {}
     key_tuple = tuple(target_domains)
@@ -418,11 +411,8 @@ def slice_matrices_with_ratios(target_domains, Global_D, Global_Y, Global_H, dom
 
 
 def compute_Q(D, w, eps=1e-12):
-    # Numerator: w_j * p(i | j)
-    WD = D * w.reshape(1, -1)  # shape: (N, k)
-    # Denominator: sum_s w_s * p(i | s)
-    Z = WD.sum(axis=1, keepdims=True)  # shape: (N, 1)
-    # Normalize per sample i
+    WD = D * w.reshape(1, -1)
+    Z = WD.sum(axis=1, keepdims=True)
     Q = WD / np.maximum(Z, eps)
     return Q
 
@@ -433,50 +423,13 @@ def evaluate_accuracy(w, D, H, Y):
     return accuracy_score(Y.argmax(axis=1), final_preds.argmax(axis=1)) * 100.0
 
 
-def check_correlation(D, H, Y, domains):
-    print("\n" + "=" * 60)
-    print(">>> DIAGNOSTIC CHECK: Does High Density (D) Predict Accuracy? <<<")
-
-    # Convert Y to indices (True Labels)
-    if Y.ndim > 1:
-        y_true = np.argmax(Y, axis=1)
-    else:
-        y_true = Y
-
-    for k, name in enumerate(domains):
-        print(f"\n--- Domain: {name} ---")
-
-        # 1. Check: Did this model predict correctly?
-        preds = np.argmax(H[:, :, k], axis=1)
-        is_correct = (preds == y_true)
-
-        # 2. Get the Density Score (D) for this model
-        density_scores = D[:, k]
-
-        # 3. Calculate Averages
-        avg_d_correct = np.mean(density_scores[is_correct])
-        avg_d_wrong = np.mean(density_scores[~is_correct])
-
-        print(f"  Avg D when CORRECT: {avg_d_correct:.4e}")
-        print(f"  Avg D when WRONG:   {avg_d_wrong:.4e}")
-
-        # 4. Final Verdict
-        if avg_d_correct > avg_d_wrong:
-            ratio = avg_d_correct / (avg_d_wrong + 1e-20)
-            print(f"  ✅ [GOOD] Positive correlation (Ratio: {ratio:.2f}x)")
-            print("     High D correlates with correct predictions. The signal is valid.")
-        else:
-            print("  ❌ [BAD] Negative or No correlation!")
-            print("     High D correlates with errors (misleading signal).")
-
-    print("=" * 60 + "\n")
 # ==========================================
 # MAIN EXECUTION LOOPS
 # ==========================================
 
 def run_cvxpy_smoothed_loop(Y, D, H, target_list):
     buf = io.StringIO()
-    print(comprehensive_debug_analysis(buf, Y, D, H, target_list, SOURCE_ERRORS))
+
     # --------------------------------------------------
     # Solvers 3.21 / 3.22 / 3.23 (with eta)
     # --------------------------------------------------
@@ -487,7 +440,7 @@ def run_cvxpy_smoothed_loop(Y, D, H, target_list):
     ]
     N, k = D.shape
     eps_multipliers = [1.5, 2.0, 4, 7, 10, 20, 30, 50]
-    eta_values = [5e-3, 1e-2, 0.1, 0.2, 0.5, 0.8]
+    eta_values = [5e-4, 5e-3, 1e-2, 0.1, 0.2, 0.5, 0.8, 1]
 
     for eps_mult in eps_multipliers:
         epsilon_vec = np.array([
@@ -510,14 +463,20 @@ def run_cvxpy_smoothed_loop(Y, D, H, target_list):
                 f"Epsilon: [{eps_str}]"
                 f"delta: {delta}"
             )
-            L_mat = calculate_expected_loss(Y, H, D, k)
+
             try:
+                # IMPORTANT: P3.10 inside cvxpy_solver.py likely also calls
+                # a loss calculation. If it calculates it dynamically,
+                # you might need to patch it there too, or pass L_mat explicitly if supported.
+                # Assuming here it behaves similarly or we trust it.
+                L_mat = calculate_expected_loss(Y, H, D, k)
                 w_310 = solve_convex_problem_mosek(
                     Y, D, H,
                     delta=delta,
                     epsilon=epsilon_vec,
                     L_mat=L_mat,
                     solver_type='SCS'
+
                 )
 
                 if w_310 is not None:
@@ -594,62 +553,14 @@ def run_baselines_and_dc(Y, D, H, target_domains, oracle_w):
     buf = io.StringIO()
     K = len(target_domains)
 
-    # -------------------------------------------------------------------
-    # 1. NEW: Max Possible Accuracy (Theoretical Upper Bound)
-    # -------------------------------------------------------------------
-    y_true = np.argmax(Y, axis=1)
-    source_preds = np.argmax(H, axis=1)  # (N, K)
-
-    # מטריצה בוליאנית: האם מקור k צדק בתמונה i?
-    is_correct_matrix = (source_preds == y_true[:, None])
-
-    # חישוב ה-Accuracy המקסימלי
-    solvable_samples = np.any(is_correct_matrix, axis=1)
-    max_possible_acc = np.mean(solvable_samples) * 100.0
-
-    # --- חישוב המשקולות האפקטיביות (Effective W) ---
-    # מונעים חלוקה באפס
-    num_correct_per_sample = is_correct_matrix.sum(axis=1, keepdims=True)
-    safe_divisor = num_correct_per_sample.copy()
-    safe_divisor[safe_divisor == 0] = 1
-
-    credits = is_correct_matrix.astype(float) / safe_divisor
-    credits[~solvable_samples] = 0
-
-    total_credits = credits.sum(axis=0)
-
-    if total_credits.sum() > 0:
-        effective_w = total_credits / total_credits.sum()
-    else:
-        effective_w = np.zeros(K)
-
-    eff_w_str = str(np.round(effective_w, 4))
-
-    # יצירת ההודעה
-    msg = f"{'MAX_ORACLE':<18} | {'N/A':<6} | {'N/A':<5} | {max_possible_acc:<12.2f} | {eff_w_str}"
-
-    # --- הוספתי את שורת ההדפסה כאן ---
-    print(f" >>> {msg}")
-    # ---------------------------------
-
-    buf.write(msg + "\n")
-
-    # -------------------------------------------------------------------
-    # 2. Standard Baselines
-    # -------------------------------------------------------------------
+    # Oracle & Uniform
     w_unif = np.ones(K) / K
-
-    for name, w in [("TRUE_W (Prior)", oracle_w), ("UNIFORM", w_unif)]:
+    for name, w in [("ORACLE", oracle_w), ("UNIFORM", w_unif)]:
         acc = evaluate_accuracy(w, D, H, Y)
         w_str = str(np.round(w, 4))
-        baseline_msg = f"{name:<18} | {'N/A':<6} | {'N/A':<5} | {acc:<12.2f} | {w_str}"
+        buf.write(f"{name:<18} | {'N/A':<6} | {'N/A':<5} | {acc:<12.2f} | {w_str}\n")
 
-        print(f" >>> {baseline_msg}")  # הוספתי הדפסה גם לבייסליינים הרגילים
-        buf.write(baseline_msg + "\n")
-
-    # -------------------------------------------------------------------
-    # 3. DC Solver
-    # -------------------------------------------------------------------
+    # DC Solver
     dc_accuracies, best_w, best_acc = [], None, -1
     N, C, K_dim = H.shape
     D_expanded = np.tile(D[:, None, :], (1, C, 1))
@@ -670,102 +581,146 @@ def run_baselines_and_dc(Y, D, H, target_domains, oracle_w):
 
     if dc_accuracies:
         avg = f"{np.mean(dc_accuracies):.2f} +/- {np.std(dc_accuracies):.2f}"
-        msg_dc = f"{'DC (5-Seeds)':<18} | {'N/A':<6} | {'N/A':<5} | {avg:<12} | {str(np.round(best_w, 4))}"
-        print(f" >>> {msg_dc}")  # הוספתי הדפסה גם ל-DC
-        buf.write(msg_dc + "\n")
+        buf.write(f"{'DC (5-Seeds)':<18} | {'N/A':<6} | {'N/A':<5} | {avg:<12} | {str(np.round(best_w, 4))}\n")
     else:
-        print(f" >>> {'DC (5-Seeds)':<18} | FAILED")
         buf.write(f"{'DC (5-Seeds)':<18} | FAILED\n")
 
     return buf.getvalue()
 
 
-def comprehensive_debug_analysis(buf, Y, D, H, target_domains, source_errors):
-    print("\n   >>> COMPREHENSIVE DEBUG ANALYSIS <<<")
+# def sanity_check_sources(Y, H, domains):
+#     print("\n" + "!" * 60)
+#     print(">>> SANITY CHECK: Testing Source Models on Loaded Data <<<")
+#
+#     # Y shape: (N, Classes) or (N,) depending on your flattening
+#     # H shape: (N, Classes, n_sources)
+#
+#     # Convert Y to indices if it's one-hot
+#     if Y.ndim > 1:
+#         y_true = np.argmax(Y, axis=1)
+#     else:
+#         y_true = Y
+#
+#     n_sources = len(domains)
+#
+#     for i, source_name in enumerate(domains):
+#         # Get predictions of source 'i'
+#         preds = H[:, :, i]  # Shape (N, Classes)
+#         pred_labels = np.argmax(preds, axis=1)
+#
+#         acc = np.mean(pred_labels == y_true)
+#         err = 1.0 - acc
+#
+#         print(f"Source [{source_name}] -> Calculated Error on CURRENT Data: {err:.4f}")
+#
+#     print("!" * 60 + "\n")
+def sanity_check_sources(Y, H, domains):
+    print("\n" + "!" * 60)
+    print(">>> SANITY CHECK: Testing Source Models on Loaded Data <<<")
 
-    # Simple check for NaN
-    if np.any(np.isnan(D)):
-        print("   [CRITICAL FAIL] D matrix contains NaN!")
-        buf.write("   [CRITICAL FAIL] D matrix contains NaN!\n")
+    # המרת Y לאינדקסים
+    if Y.ndim > 1:
+        y_true = np.argmax(Y, axis=1)
+    else:
+        y_true = Y
 
-    K = len(target_domains)
-    w_unif = np.ones(K) / K
-    Q_unif = compute_Q(D, w_unif)
-    pred_target = (H * Q_unif[:, None, :]).sum(axis=2)
-    correct_probs = (pred_target * Y).sum(axis=1)
-    empirical_target_loss = 1.0 - np.mean(correct_probs)
+    for i, source_name in enumerate(domains):
+        preds = H[:, :, i]
+        pred_labels = np.argmax(preds, axis=1)
 
-    current_source_errors = [source_errors[d] for d in target_domains]
-    weighted_source_err = np.dot(w_unif, current_source_errors)
-    gap = empirical_target_loss - weighted_source_err
+        acc = np.mean(pred_labels == y_true)
+        err = 1.0 - acc
 
-    print(f"   [FEASIBILITY CHECK] Gap: {gap:.4f}")
-    return gap
+        print(f"Source [{source_name}] -> Calculated Error: {err:.4f}")
 
+    # --- הבדיקה החדשה: האם התחזיות של DSLR ו-Webcam זהות? ---
+    if 'dslr' in domains and 'webcam' in domains:
+        idx_d = domains.index('dslr')
+        idx_w = domains.index('webcam')
+
+        # חישוב ההפרש בין ההסתברויות (L1 Distance)
+        diff = np.sum(np.abs(H[:, :, idx_d] - H[:, :, idx_w]))
+        print("-" * 40)
+        print(f"Difference between DSLR and WEBCAM probability matrices: {diff:.4f}")
+
+        if diff < 0.01:
+            print(">>> CRITICAL WARNING: DSLR and WEBCAM predictions are IDENTICAL!")
+            print(">>> This implies a bug in how H is constructed (copying columns?)")
+        else:
+            print(">>> OK: Predictions are different. Identical error rate might be coincidence.")
+
+    print("!" * 60 + "\n")
+
+
+def check_domain_alignment(D, domain_ranges):
+    print("\n" + "?" * 60)
+    print(">>> ALIGNMENT CHECK: Does D match the data blocks? <<<")
+
+    # D columns: 0=Amazon, 1=DSLR, 2=Webcam
+    for i, dom_name in enumerate(['amazon', 'dslr', 'webcam']):
+        start, end = domain_ranges[dom_name]
+
+        # מוציאים את החלק ב-D שאמור להתאים לדומיין הזה
+        d_block = D[start:end, :]
+
+        # מחשבים ממוצע לכל עמודה בבלוק הזה
+        # אנחנו מצפים שהעמודה ה-i תהיה הכי חזקה בבלוק ה-i
+        mean_probs = np.mean(d_block, axis=0)
+
+        print(f"Data Block [{dom_name}] (Rows {start}-{end}):")
+        print(f"   -> Avg prob for Amazon (Col 0): {mean_probs[0]:.4f}")
+        print(f"   -> Avg prob for DSLR   (Col 1): {mean_probs[1]:.4f}")
+        print(f"   -> Avg prob for Webcam (Col 2): {mean_probs[2]:.4f}")
+
+        # בדיקה אוטומטית: האם העמודה הנכונה קיבלה את הציון הכי גבוה?
+        best_col = np.argmax(mean_probs)
+        if best_col == i:
+            print(f"   [OK] Matches column {best_col}")
+        else:
+            print(f"   [FAIL] Expected max at col {i}, but got {best_col}!")
+
+    print("?" * 60 + "\n")
 
 def main():
-    global CURRENT_ACTIVE_DOMAINS
+    global CURRENT_ACTIVE_DOMAINS  # Use global to pass info to calculate_expected_loss
+
     Global_D, Global_Y, Global_H, domain_ranges = load_data_and_compute_matrices()
-    check_correlation(Global_D, Global_H, Global_Y, DOMAINS)
+
     results_path = os.path.join(
         RESULTS_DIR,
-        "RealTargets_all_solvers_fixed_Lt_diff_D.txt"
+        "MIXTargets_all_solvers_T8_fixed_Lt.txt"
     )
-
+    sanity_check_sources(Global_Y, Global_H, ['amazon', 'dslr', 'webcam'])
+    check_domain_alignment(Global_D, domain_ranges)
     with open(results_path, "w") as fp:
         fp.write(
-            "MSA REPORT | Real LODO Targets | Solvers 3.21 / 3.22 / 3.23\n"
+            "MSA REPORT |Mix Targets Targets | Solvers 3.21 / 3.22 / 3.23\n"
         )
         fp.write("=" * 80 + "\n\n")
 
         # ======================================================
         # LODO LOOP: each real domain is target
         # ======================================================
-        for target_domain in DOMAINS:
-            source_domains = [d for d in DOMAINS if d != target_domain]
-            CURRENT_ACTIVE_DOMAINS = source_domains
-            print(f"\n>>> TARGET DOMAIN: {target_domain}")
-            print(f" SOURCES: {source_domains}")
+        for target_domains in TARGET_RATIOS:
+            # --- UPDATE GLOBAL STATE ---
+            CURRENT_ACTIVE_DOMAINS = list(target_domains)
 
-            header = f"TARGET: {target_domain} | SOURCES: {source_domains}"
+            print("\n" + "#" * 90)
+            print("[MAIN] RUN TARGET MIXTURE:", target_domains)
+            print("#" * 90)
+
+            Y, D, H, oracle_w = slice_matrices_with_ratios(
+                target_domains, Global_D, Global_Y, Global_H, domain_ranges
+            )
+            sources = list(target_domains)
+            header = f"TARGET: {target_domains} | SOURCES: {sources}"
             fp.write(header + "\n")
             fp.write("-" * len(header) + "\n")
-
-            # ----------------------------------
-            # 1. Slice TARGET samples only
-            # ----------------------------------
-            start_t, end_t = domain_ranges[target_domain]
-            row_indices = np.arange(start_t, end_t)
-
-            source_col_indices = [DOMAINS.index(d) for d in source_domains]
-
-            Y_sub = Global_Y[row_indices]
-            D_sub = Global_D[row_indices][:, source_col_indices]
-            H_sub = Global_H[row_indices][:, :, source_col_indices]
-
-            # ----------------------------------
-            # 3. Oracle = true source proportions
-            # ----------------------------------
-            source_sizes = []
-            for d in source_domains:
-                s, e = domain_ranges[d]
-                source_sizes.append(e - s)
-
-            source_sizes = np.array(source_sizes, dtype=float)
-            oracle_w = source_sizes / source_sizes.sum()
-
-            print(f" Source sizes: {dict(zip(source_domains, source_sizes))}")
-            print(f" Oracle w: {oracle_w}")
-
-            fp.write(f"Source sizes: {source_sizes.tolist()}\n")
             fp.write(f"Oracle w: {oracle_w.tolist()}\n\n")
 
-            # ----------------------------------
-            # 4. Baselines + DC
-            # ----------------------------------
             fp.write(
                 run_baselines_and_dc(
-                    Y_sub, D_sub, H_sub, source_domains, oracle_w
+                    Y, D, H, sources, oracle_w
                 )
             )
 
@@ -774,7 +729,7 @@ def main():
             # ----------------------------------
             fp.write(
                 run_cvxpy_smoothed_loop(
-                    Y_sub, D_sub, H_sub, source_domains
+                    Y, D, H, sources
                 )
             )
 

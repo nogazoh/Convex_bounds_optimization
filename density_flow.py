@@ -27,7 +27,6 @@ BATCH_SIZE = 64
 LR = 1e-3
 
 # --- HYPER PARAMETER: TEMPERATURE ---
-# Value 8.0 chosen based on Log-Gap analysis to reduce sharpness.
 TEMPERATURE = 8.0
 
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -42,13 +41,13 @@ class ConvAutoencoder(nn.Module):
         super().__init__()
         # Encoder
         self.encoder = nn.Sequential(
-            nn.Conv2d(3, 32, 4, 2, 1),  # 32x32
+            nn.Conv2d(3, 32, 4, 2, 1),
             nn.BatchNorm2d(32), nn.LeakyReLU(0.2),
-            nn.Conv2d(32, 64, 4, 2, 1),  # 16x16
+            nn.Conv2d(32, 64, 4, 2, 1),
             nn.BatchNorm2d(64), nn.LeakyReLU(0.2),
-            nn.Conv2d(64, 128, 4, 2, 1),  # 8x8
+            nn.Conv2d(64, 128, 4, 2, 1),
             nn.BatchNorm2d(128), nn.LeakyReLU(0.2),
-            nn.Conv2d(128, 256, 4, 2, 1),  # 4x4
+            nn.Conv2d(128, 256, 4, 2, 1),
             nn.BatchNorm2d(256), nn.LeakyReLU(0.2),
             nn.Flatten(),
             nn.Linear(256 * 4 * 4, latent_dim)
@@ -56,13 +55,13 @@ class ConvAutoencoder(nn.Module):
         # Decoder
         self.decoder_fc = nn.Linear(latent_dim, 256 * 4 * 4)
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, 4, 2, 1),  # 8x8
+            nn.ConvTranspose2d(256, 128, 4, 2, 1),
             nn.BatchNorm2d(128), nn.LeakyReLU(0.2),
-            nn.ConvTranspose2d(128, 64, 4, 2, 1),  # 16x16
+            nn.ConvTranspose2d(128, 64, 4, 2, 1),
             nn.BatchNorm2d(64), nn.LeakyReLU(0.2),
-            nn.ConvTranspose2d(64, 32, 4, 2, 1),  # 32x32
+            nn.ConvTranspose2d(64, 32, 4, 2, 1),
             nn.BatchNorm2d(32), nn.LeakyReLU(0.2),
-            nn.ConvTranspose2d(32, 3, 4, 2, 1),  # 64x64
+            nn.ConvTranspose2d(32, 3, 4, 2, 1),
             nn.Sigmoid()
         )
 
@@ -73,7 +72,7 @@ class ConvAutoencoder(nn.Module):
 
 
 # ==========================================
-# 2. MODEL: FLOW MATCHING (FIXED BROADCASTING)
+# 2. MODEL: FLOW MATCHING
 # ==========================================
 class VectorFieldNet(nn.Module):
     def __init__(self, dim, hidden_dim=128):
@@ -87,23 +86,14 @@ class VectorFieldNet(nn.Module):
         )
 
     def forward(self, t, x):
-        # --- FIX: Robust t broadcasting ---
-        # Ensure t is a tensor
         if not torch.is_tensor(t):
             t = torch.tensor([t], dtype=x.dtype, device=x.device)
-
-        # If t is scalar (0-dim), make it 1-dim
         if t.ndim == 0:
             t = t.unsqueeze(0)
-
-        # Broadcast t to [Batch_Size, 1]
-        # We handle cases where t might already be (B, 1) or just (1)
         if t.shape[0] != x.shape[0]:
             t = t.view(-1, 1).expand(x.shape[0], 1)
         else:
             t = t.view(-1, 1)
-
-        # Concatenate
         return self.net(torch.cat([x, t], dim=-1))
 
 
@@ -128,7 +118,6 @@ class FlowMatchingODE(nn.Module):
 def compute_ll(vector_field, z_target, dim):
     ode = FlowMatchingODE(vector_field, dim)
     bs = z_target.shape[0]
-    # Solve backwards
     traj = odeint(ode, (z_target, torch.zeros(bs, 1).to(z_target.device)),
                   torch.tensor([1.0, 0.0]).to(z_target.device), method='dopri5', atol=1e-4, rtol=1e-4)
     z0, dlogp = traj[0][-1], traj[1][-1]
@@ -137,13 +126,17 @@ def compute_ll(vector_field, z_target, dim):
 
 
 # ==========================================
-# 3. DATA & UTILS
+# 3. DATA UTILS
 # ==========================================
-def get_loaders(domain):
+def get_loaders_for_training(domain):
+    """
+    Used ONLY for Phase 1 (Training Generative Models).
+    Splits 80/20 because we don't want to train the Flow on the Test set (Leakage).
+    """
     path = os.path.join(OFFICE_DIR, domain, 'images')
     if not os.path.exists(path): path = os.path.join(OFFICE_DIR, domain)
 
-    print(f"   -> Loading data from: {path}")
+    print(f"   -> Loading Training data from: {path}")
     tr = transforms.Compose([
         transforms.Resize((IMG_SIZE, IMG_SIZE)),
         transforms.ToTensor()
@@ -152,18 +145,15 @@ def get_loaders(domain):
     try:
         ds = datasets.ImageFolder(path, transform=tr)
     except FileNotFoundError:
-        print(f"CRITICAL ERROR: Could not find data at {path}")
         return None, None
 
     N = len(ds)
-    # IMPORTANT: Fixed seed for consistency with Solver script
     rng = np.random.RandomState(42)
     indices = rng.permutation(N)
 
     train_ds = torch.utils.data.Subset(ds, indices[:int(0.8 * N)])
-    test_ds = torch.utils.data.Subset(ds, indices[int(0.8 * N):])
-
-    return DataLoader(train_ds, BATCH_SIZE, True), DataLoader(test_ds, BATCH_SIZE, False)
+    # We ignore test_ds here for training purposes
+    return DataLoader(train_ds, BATCH_SIZE, True), None
 
 
 # ==========================================
@@ -178,11 +168,11 @@ def run_experiment():
     stats_dict = {}
 
     # -------------------------------------------
-    # PHASE 1: Train Models
+    # PHASE 1: Train Models (on 80% split)
     # -------------------------------------------
     for dom in DOMAINS:
         print(f"\n🚀 Processing Domain: {dom}")
-        train_loader, _ = get_loaders(dom)
+        train_loader, _ = get_loaders_for_training(dom)
 
         if train_loader is None: continue
 
@@ -237,85 +227,88 @@ def run_experiment():
         torch.save({'mu': mu, 'std': std}, os.path.join(paths['models'], f"stats_{dom}.pt"))
 
     # -------------------------------------------
-    # PHASE 2: Analyze Matrix D
+    # PHASE 2: Analyze Matrix D on FULL DATASET
     # -------------------------------------------
-    print(f"\n[ANALYSIS] Computing Matrix D with Temperature Scaling (T={TEMPERATURE})...")
+    print(f"\n[ANALYSIS] Computing Matrix D for FULL DATASET (T={TEMPERATURE})...")
 
-    # 1. Collect All Test Data
+    # 1. Collect ALL Data (Deterministic Order)
     all_imgs = []
     labels = []
+
+    # Standard transform (No Augmentation) for D computation
+    tr = transforms.Compose([
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.ToTensor()
+    ])
+
     for d in DOMAINS:
-        _, tl = get_loaders(d)
-        if tl is None: continue
-        for x, _ in tl:
+        path = os.path.join(OFFICE_DIR, d, 'images')
+        if not os.path.exists(path): path = os.path.join(OFFICE_DIR, d)
+
+        # Load FULL folder, NO shuffle, NO split
+        ds = datasets.ImageFolder(path, transform=tr)
+        dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False)
+
+        print(f"   -> Collecting FULL data from: {d} ({len(ds)} images)")
+
+        for x, _ in dl:
             all_imgs.append(x)
             labels.extend([d] * x.size(0))
 
-    X_test_all = torch.cat(all_imgs)  # CPU to save GPU memory
-    N = len(X_test_all)
+    X_all = torch.cat(all_imgs)
+    N = len(X_all)
     K = len(DOMAINS)
 
-    # 2. Compute Raw Log Probabilities
+    print(f"   -> Total images for D matrix: {N}")
+
+    # 2. Compute Likelihoods
     Raw_LogP = np.zeros((N, K))
 
     with torch.no_grad():
         for k, dom_model in enumerate(DOMAINS):
-            print(f"   -> Evaluating Model: {dom_model}")
+            print(f"   -> Evaluating Model: {dom_model} on full dataset...")
             ae = ae_models[dom_model]
             fm = fm_models[dom_model]
             mu, std = stats_dict[dom_model]
 
-            # Batch processing for evaluation
             bs = 32
             scores = []
             for i in range(0, N, bs):
-                x_batch = X_test_all[i:i + bs].to(device)
+                x_batch = X_all[i:i + bs].to(device)
 
-                # Encode & Normalize using specific model stats
+                # Encode & Normalize
                 _, z = ae(x_batch)
                 z_norm = (z - mu) / std
 
-                # Compute Exact Log Likelihood
+                # Compute Likelihood
                 ll = compute_ll(fm, z_norm, LATENT_DIM)
                 scores.append(ll.cpu().numpy())
 
             Raw_LogP[:, k] = np.concatenate(scores).flatten()
 
-    # 3. Normalization + Scaling with TEMPERATURE
-    D = np.zeros((N, K))
-    print(f"   -> Applying Softmax with T={TEMPERATURE}")
+    # 3. Scale and Save
+    print(f"   -> Applying GLOBAL Likelihood scaling with T={TEMPERATURE}")
+    Raw_LogP = Raw_LogP.astype(np.float64)
+    global_max = np.max(Raw_LogP)
+    scaled_log_p = (Raw_LogP - global_max) / TEMPERATURE
+    min_clip = -100.0
+    scaled_log_p = np.maximum(scaled_log_p, min_clip)
+    D = np.exp(scaled_log_p)
+    D = D / np.max(D)
 
-    for i in range(K):
-        col_log_p = Raw_LogP[:, i]
-
-        # Stability shift
-        col_max = np.max(col_log_p)
-
-        # Apply Temperature Scaling BEFORE exp
-        # P ~ exp(logP / T)
-        exp_p = np.exp((col_log_p - col_max) / TEMPERATURE)
-
-        col_sum = np.sum(exp_p)
-        if col_sum == 0: col_sum = 1e-10
-
-        col_normalized = exp_p / col_sum
-        D[:, i] = col_normalized * N
-
-    # Filename includes Temperature for clarity
-    filename = f"D_Matrix_LatentFlow_T{int(TEMPERATURE)}.npy"
+    filename = f"D_Matrix_LatentFlow_T{int(TEMPERATURE)}_FULL_DATA.npy"
     save_path = os.path.join(paths['results'], filename)
     np.save(save_path, D)
     print(f"   -> Matrix saved to {save_path}")
 
-    # 4. Plotting
+    # 4. Plotting (Optional visual check)
     print(f"   -> Generating Plots...")
     D_plot = D / N
-
     fig, axes = plt.subplots(K, K, figsize=(15, 15))
     color_map = {d: plt.cm.tab10(idx) for idx, d in enumerate(DOMAINS)}
 
-    for i in range(K):  # Row (Target)
-        for j in range(K):  # Col (Source)
+    for i in range(K):
+        for j in range(K):
             ax = axes[i, j]
             if i == j:
                 ax.set_title(f"Model: {DOMAINS[i]}")
@@ -329,9 +322,9 @@ def run_experiment():
                 ax.set_xlabel(f"P({DOMAINS[j]})")
                 ax.set_ylabel(f"P({DOMAINS[i]})")
 
-    plt.suptitle(f"D Matrix Analysis - LatentFlow (T={TEMPERATURE})", fontsize=16)
+    plt.suptitle(f"D Matrix Analysis (FULL DATA) - T={TEMPERATURE}", fontsize=16)
     plt.tight_layout()
-    plt.savefig(os.path.join(paths['plots'], f"LatentFlow_Analysis_T{int(TEMPERATURE)}.png"))
+    plt.savefig(os.path.join(paths['plots'], f"LatentFlow_Analysis_T{int(TEMPERATURE)}_FULL.png"))
     print("✅ Done.")
 
 

@@ -40,7 +40,6 @@ class Grey_32_64_128_gp(nn.Module):
         self.conv3_2_bn = nn.BatchNorm2d(128)
         self.conv3_3 = nn.Conv2d(128, 128, (3, 3), padding=1)
         self.conv3_3_bn = nn.BatchNorm2d(128)
-        # self.pool3 = nn.MaxPool2d((2, 2))
 
         self.drop1 = nn.Dropout()
 
@@ -74,11 +73,9 @@ def build_network(domain):
     """
     Returns the appropriate model architecture based on the domain name.
     """
-    # Group A: Digits (1 channel, 10 classes)
     if domain in ['MNIST', 'USPS', 'SVHN']:
         return Grey_32_64_128_gp(n_classes=10)
 
-    # Group B: Office-Home (3 channels, 65 classes)
     elif domain in ['Art', 'Clipart', 'Product', 'Real World']:
         model = models.resnet50(weights='IMAGENET1K_V1')
         n_classes = 65
@@ -86,11 +83,9 @@ def build_network(domain):
         model.fc = nn.Linear(num_ftrs, n_classes)
         return model
 
-    # Group C: Office-31 (3 channels, 31 classes) -- NEW
     elif domain in ['amazon', 'dslr', 'webcam']:
-        # Loading ResNet50 pre-trained on ImageNet
         model = models.resnet50(weights='IMAGENET1K_V1')
-        n_classes = 31  # Specific for Office-31
+        n_classes = 31
         num_ftrs = model.fc.in_features
         model.fc = nn.Linear(num_ftrs, n_classes)
         return model
@@ -159,26 +154,20 @@ def test(network, test_loader):
 
 
 def run_classifier(domain):
-    # 1. Get Data
-    # This will now use the NEW logic in data.py (Saenko split for Office-31)
     train_loader, test_loader, config = Data.get_data_loaders(domain)
-
-    # 2. Build Network
     network = build_network(domain).to(Data.device)
 
-    # 3. Configure Hyperparameters
-    # Digits usually need higher LR, while Transfer Learning (ResNet) needs lower.
+
     if domain in ['MNIST', 'USPS', 'SVHN']:
         lr = 0.005
         max_epochs = 200
         use_scheduler = False
     else:
-        # Covers Office-Home AND Office-31
-        lr = 0.001
+        lr = 0.0001
         max_epochs = 50
         use_scheduler = True
 
-    optimizer = optim.Adam(network.parameters(), lr=lr)
+    optimizer = optim.Adam(network.parameters(), lr=lr, weight_decay=1e-5)
 
     scheduler = None
     if use_scheduler:
@@ -191,33 +180,29 @@ def run_classifier(domain):
     print(f"STARTING TRAIN: {domain} | Max Epochs: {max_epochs} | LR: {lr} | Device: {Data.device}")
 
     for epoch in range(1, max_epochs + 1):
-
         avg_loss = train(network, optimizer, train_loader, epoch)
         train_losses.append(avg_loss)
 
         if scheduler:
             scheduler.step()
 
-        # Validation on Test Set (Standard protocol for these benchmarks)
-        if epoch % 1 == 0:
-            acc = test(network, test_loader)
+        acc = test(network, test_loader)
 
-            if acc > best_acc:
-                best_acc = acc
-                save_path = f"./classifiers_new/{domain}_classifier.pt"
-                torch.save(network.state_dict(), save_path)
-                print(f"*** New Best Model Saved (Acc: {best_acc:.2f}%) ***")
+        if acc > best_acc:
+            best_acc = acc
+            # Saving with _224 suffix
+            save_path = f"./classifiers/{domain}_224.pt"
+            torch.save(network.state_dict(), save_path)
+            print(f"*** New Best Model Saved (Acc: {best_acc:.2f}%) ***")
 
-        # Simple convergence check
         if len(train_losses) > 5 and \
                 np.abs(train_losses[-1] - train_losses[-2]) <= epsilon and \
                 np.abs(train_losses[-2] - train_losses[-3]) <= epsilon:
             print("Loss Converged.")
             break
 
-    # If something went wrong and we never saved (e.g. 0 accuracy), save anyway
     if best_acc == 0:
-        save_path = f"./classifiers_new/{domain}_classifier.pt"
+        save_path = f"./classifiers/{domain}_224.pt"
         torch.save(network.state_dict(), save_path)
 
     print(f"=== Finished {domain}. Best Accuracy: {best_acc:.2f}% ===")
@@ -227,39 +212,24 @@ def run_classifier(domain):
 # --- Parallel Execution Wrapper ---
 
 def parallel_wrapper(domain):
-    """
-    Wrapper function for parallel execution.
-    If model exists -> Loads and Evaluates it.
-    If model missing -> Trains it.
-    """
     print(f"--- Process starting for {domain} on PID {os.getpid()} ---")
 
+    # Checking for the _224 version
     save_path = f"./classifiers_new/{domain}_classifier.pt"
 
-    # If the model already exists, we LOAD and TEST it
     if os.path.exists(save_path):
         print(f"[{domain}] Found existing model at {save_path}. Evaluating...")
-
         try:
-            # 1. Build empty architecture
             model = build_network(domain).to(Data.device)
-
-            # 2. Load weights
             model.load_state_dict(torch.load(save_path, map_location=Data.device))
-
-            # 3. Get test data
             _, test_loader, _ = Data.get_data_loaders(domain)
-
-            # 4. Run test
             acc = test(model, test_loader)
             print(f"[{domain}] Existing model accuracy: {acc:.2f}%")
             return acc
-
         except Exception as e:
-            print(f"[{domain}] Error loading existing model: {e}. Will re-train.")
+            print(f"[{domain}] Error loading: {e}. Re-training...")
             pass
 
-    # If we are here, either model didn't exist or failed to load
     return run_classifier(domain)
 
 
@@ -270,26 +240,23 @@ def evaluate_cross_domain(domains):
     print(">>> STARTING CROSS-DOMAIN EVALUATION MATRIX <<<")
     print("#" * 60)
 
-    # 1. Pre-load all Test Data Loaders to save time
     print("--> Pre-loading test datasets...")
     test_loaders = {}
     for d in domains:
         _, test_loader, _ = Data.get_data_loaders(d)
         test_loaders[d] = test_loader
 
-    # Dictionary to store results: results[Source][Target] = Error
     results_matrix = {s: {} for s in domains}
 
-    # 2. Iterate over each Source Domain (Load Model)
     for source in domains:
         print(f"\n[Source Model: {source}] Loading weights...")
 
-        # Build model and load weights
         model = build_network(source).to(Data.device)
+        # Loading from the _224 version
         model_path = f"./classifiers_new/{source}_classifier.pt"
 
         if not os.path.exists(model_path):
-            print(f"[WARNING] Model for {source} not found. Skipping.")
+            print(f"[WARNING] Model for {source} not found at {model_path}. Skipping.")
             continue
 
         try:
@@ -299,10 +266,8 @@ def evaluate_cross_domain(domains):
             print(f"[ERROR] Could not load {source}: {e}")
             continue
 
-        # 3. Test against ALL Target Domains
         for target in domains:
             loader = test_loaders[target]
-
             correct = 0
             total = 0
 
@@ -323,7 +288,6 @@ def evaluate_cross_domain(domains):
 
             print(f"   -> Tested on {target:<10} | Acc: {accuracy:.2%} | Err: {error:.4f}")
 
-    # 4. Print Final Formatted Matrix
     print("\n" + "=" * 80)
     print(f"{'SOURCE (Model) / TARGET (Data)':<30} | " + " | ".join([f"{d:<10}" for d in domains]))
     print("-" * 80)
@@ -343,25 +307,16 @@ def evaluate_cross_domain(domains):
 # --- Main Execution Block ---
 
 if __name__ == '__main__':
-    save_dir = os.path.join(os.path.dirname(__file__), "classifiers_new")
+    # Ensure the directory matches the path used in the functions
+    save_dir = "./classifiers"
     os.makedirs(save_dir, exist_ok=True)
-
-    # === CONFIGURATION: Choose your dataset ===
-
-    # CASE 1: Office-31 (Current Task)
-    domains_to_run = ['amazon', 'dslr', 'webcam']
 
     # CASE 2: Office-Home
     # domains_to_run = ['Art', 'Clipart', 'Product', 'Real World']
-
-    # CASE 3: Digits
-    # domains_to_run = ['MNIST', 'USPS', 'SVHN']
-
+    domains_to_run = ['amazon', 'dslr', 'webcam']
     print(f"Running for domains: {domains_to_run}")
 
-    # 1. Train models (or load if exist)
-    # Using 1 job to avoid GPU memory issues, increase if using CPU only or multiple GPUs
-    num_jobs = 1
+    num_jobs = 2
 
     results = Parallel(n_jobs=num_jobs, backend="loky")(
         delayed(parallel_wrapper)(d) for d in domains_to_run
@@ -371,5 +326,4 @@ if __name__ == '__main__':
     print("INDIVIDUAL TRAINING COMPLETED")
     print("=" * 30)
 
-    # 2. Evaluate Matrix (Cross-Domain)
     evaluate_cross_domain(domains_to_run)
