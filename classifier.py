@@ -34,13 +34,14 @@ class Grey_32_64_128_gp(nn.Module):
         self.conv2_2_bn = nn.BatchNorm2d(64)
         self.conv2_3 = nn.Conv2d(64, 64, (3, 3), padding=1)
         self.conv2_3_bn = nn.BatchNorm2d(64)
+        self.pool2 = nn.MaxPool2d((2, 2))
         self.conv3_1 = nn.Conv2d(64, 128, (3, 3), padding=1)
         self.conv3_1_bn = nn.BatchNorm2d(128)
         self.conv3_2 = nn.Conv2d(128, 128, (3, 3), padding=1)
         self.conv3_2_bn = nn.BatchNorm2d(128)
         self.conv3_3 = nn.Conv2d(128, 128, (3, 3), padding=1)
         self.conv3_3_bn = nn.BatchNorm2d(128)
-
+        self.pool3 = nn.MaxPool2d((2, 2))
         self.drop1 = nn.Dropout()
 
         self.fc4 = nn.Linear(128, 128)
