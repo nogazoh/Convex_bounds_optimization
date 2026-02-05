@@ -50,6 +50,8 @@ torch.set_num_threads(1)
 # --- CONFIGURATION ---
 # ==========================================
 DATASET_MODE = "DIGITS"# "DIGITS" #"OFFICE224" #"OFFICE31"
+USE_PRECOMPUTED_D = True
+USE_ARTIFICIAL_RATIOS = True
 
 CONFIGS = {
     "DIGITS": {
@@ -80,9 +82,36 @@ CONFIGS = {
         "CLASSES": 31,
         "INPUT_DIM": 2048,
         "SOURCE_ERRORS": {'amazon': 0.1352, 'dslr': 0.0178, 'webcam': 0.0225},
-        "TEST_SET_SIZES": {'amazon': 2197, 'dslr': 281, 'webcam': 578},
+        "TEST_SET_SIZES": {'amazon': 563, 'dslr': 100, 'webcam': 159},
         "D_PRECOMP_PATH":"/data/nogaz/Convex_bounds_optimization/LatentFlow_Pixel_Experiments/results/D_Matrix_FINAL_GMM_Soft.npy"
     }
+}
+
+TARGET_RATIOS_CONFIG = {
+    # --- DIGITS (MNIST, USPS, SVHN) ---
+    ('MNIST', 'USPS'): {'MNIST': 0.85, 'USPS': 0.15},
+    ('MNIST', 'SVHN'): {'MNIST': 0.20, 'SVHN': 0.80},
+    ('SVHN', 'USPS'): {'SVHN': 0.75, 'USPS': 0.25},
+    ('MNIST', 'SVHN', 'USPS'): {'MNIST': 0.60, 'SVHN': 0.30, 'USPS': 0.10},
+
+    # --- OFFICE-31 (amazon, dslr, webcam) ---
+    ('amazon', 'dslr'): {'amazon': 0.20, 'dslr': 0.80},
+    ('amazon', 'webcam'): {'amazon': 0.75, 'webcam': 0.25},
+    ('dslr', 'webcam'): {'dslr': 0.30, 'webcam': 0.70},
+    ('amazon', 'dslr', 'webcam'): {'amazon': 0.15, 'dslr': 0.65, 'webcam': 0.20},
+
+    # --- OFFICE-HOME (Art, Clipart, Product, Real World) ---
+    ('Art', 'Clipart'): {'Art': 0.80, 'Clipart': 0.20},
+    ('Art', 'Product'): {'Art': 0.25, 'Product': 0.75},
+    ('Art', 'Real World'): {'Art': 0.70, 'Real World': 0.30},
+    ('Clipart', 'Product'): {'Clipart': 0.15, 'Product': 0.85},
+    ('Clipart', 'Real World'): {'Clipart': 0.35, 'Real World': 0.65},
+    ('Product', 'Real World'): {'Product': 0.80, 'Real World': 0.20},
+    ('Art', 'Clipart', 'Product'): {'Art': 0.50, 'Clipart': 0.10, 'Product': 0.40},
+    ('Art', 'Clipart', 'Real World'): {'Art': 0.15, 'Clipart': 0.70, 'Real World': 0.15},
+    ('Art', 'Product', 'Real World'): {'Art': 0.60, 'Product': 0.20, 'Real World': 0.20},
+    ('Clipart', 'Product', 'Real World'): {'Clipart': 0.10, 'Product': 0.30, 'Real World': 0.60},
+    ('Art', 'Clipart', 'Product', 'Real World'): {'Art': 0.40, 'Clipart': 0.10, 'Product': 0.10, 'Real World': 0.40}
 }
 
 CURRENT_CFG = CONFIGS[DATASET_MODE]
@@ -95,7 +124,7 @@ INPUT_DIM = CURRENT_CFG["INPUT_DIM"]
 # ==========================================
 # --- OPTIONAL: Use precomputed Global D ---
 # ==========================================
-USE_PRECOMPUTED_D = False   # If False -> always use KDE path
+   # If False -> always use KDE path
 D_PRECOMP_PATH = CURRENT_CFG["D_PRECOMP_PATH"] #"/data/nogaz/Convex_bounds_optimization/LatentFlow_Pixel_Experiments/results/D_Matrix_FINAL_GMM_Soft_OfficeHome.npy"
 
 # Root directories (adjust if needed)
@@ -330,13 +359,12 @@ def evaluate_accuracy_q(Q, H, Y):
     return accuracy_score(Y.argmax(axis=1), preds.argmax(axis=1)) * 100.0
 
 
-def run_baselines(Y, D, H, source_domains, target_domains, all_source_domains, seed):
+def run_baselines(Y, D, H, source_domains, target_domains, all_source_domains, seed, true_r_weights):
     print(" [Baseline] Running Oracle and Uniform...")
     buf = io.StringIO()
     total = sum([TEST_SET_SIZES.get(d, 1) for d in target_domains])
-    oracle_z = np.array([TEST_SET_SIZES.get(s, 0) / total if s in target_domains else 0.0 for s in source_domains])
     uniform_w = np.ones(len(source_domains)) / len(source_domains)
-    for name, w in [("ORACLE", oracle_z), ("UNIFORM", uniform_w)]:
+    for name, w in [("ORACLE", true_r_weights), ("UNIFORM", uniform_w)]:
         acc = evaluate_accuracy_wd(w, D, H, Y)
         w_f = map_weights_to_full_source_list(w, source_domains, all_source_domains)
         buf.write(f"{name:<18} | {'N/A':<15} | {'N/A':<15} | {acc:<12.2f} | {str(np.round(w_f, 4))}\n")
@@ -352,7 +380,7 @@ def run_baselines(Y, D, H, source_domains, target_domains, all_source_domains, s
 
     print(" [Baseline] Running DC Solver...")
     dc_accuracies, best_z_dc = [], None
-    for i in range(1):
+    for i in range(5):
         try:
             dp = init_problem_from_model(Y, D, H, p=len(source_domains), C=NUM_CLASSES)
             slv = ConvexConcaveSolver(ConvexConcaveProblem(dp), seed + (i * 100), "err")
@@ -494,17 +522,115 @@ def build_YDH_with_precomputed_D(target_domains, seed, classifiers,
     return Y, D, H
 
 
+def apply_custom_ratios(Y, D, H, target_domains, custom_ratios_dict):
+    current_sizes = [TEST_SET_SIZES[d] for d in target_domains]
+    requested_ratios = [custom_ratios_dict[d] for d in target_domains]
+    max_total_N = int(min([actual / ratio for actual, ratio in zip(current_sizes, requested_ratios)]))
+    new_indices = []
+    offset = 0
+    for i, dom in enumerate(target_domains):
+        n_to_take = int(max_total_N * requested_ratios[i])
+        new_indices.extend(range(offset, offset + n_to_take))
+        offset += current_sizes[i]
+    print(f" [Subsample] Adjusting matrices: Original N={sum(current_sizes)} -> New N={len(new_indices)}")
+    return Y[new_indices], D[new_indices], H[new_indices]
+
+
+# def task_run(classifiers, all_source_domains):
+#     seed = 1
+#     torch.manual_seed(seed)
+#     np.random.seed(seed)
+#     test_path = f'./results_{DATASET_MODE}_recreate/seed_{seed}/'
+#     os.makedirs(test_path, exist_ok=True)
+#
+#     if USE_PRECOMPUTED_D is False:
+#         models, normalize_factors, vae_norm_stats = handle_vae_models(all_source_domains, classifiers, seed)
+#
+#     # --- Precomputed D initialization (optional) ---
+#     Global_D = None
+#     domain_lengths = None
+#     if USE_PRECOMPUTED_D and os.path.exists(D_PRECOMP_PATH):
+#         Global_D = load_global_D_matrix(D_PRECOMP_PATH)
+#         if Global_D is not None:
+#             domain_lengths = compute_domain_lengths(all_source_domains)
+#
+#     print("\n--- Starting Target Combinations ---")
+#     with open(os.path.join(test_path, f'Sweep_Results_{seed}_PRE_D_{USE_PRECOMPUTED_D}_art_ratios{USE_ARTIFICIAL_RATIOS}.txt'), 'a') as fp:
+#         for target in [list(s) for r in range(2, len(all_source_domains) + 1) for s in
+#                        itertools.combinations(all_source_domains, r)]:
+#             # if set(target) in ({'MNIST', 'USPS'}): #, {'MNIST', 'SVHN'}):
+#             #     print("skip " + str(set(target)))
+#             #     continue
+#
+#             print(f"\n[TARGET] Starting run for: {target}")
+#             total_s = sum([TEST_SET_SIZES.get(d, 0) for d in target])
+#             true_r = map_weights_to_full_source_list(
+#                 np.array([TEST_SET_SIZES.get(d, 0) / total_s if total_s > 0 else 0 for d in target]),
+#                 target,
+#                 all_source_domains
+#             )
+#
+#             fp.write(f"\n{'=' * 120}\nTARGET: {target} | TRUE RATIOS: {np.round(true_r, 4)}\n{'=' * 120}\n")
+#             fp.write(
+#                 f"{'Solver':<18} | {'Epsilon Mult':<15} | {'Delta Mult':<15} | {'Acc (%)':<12} | {'Learned Weights'}\n" +
+#                 "-" * 120 + "\n"
+#             )
+#
+#             # ---------------------------------------------------------
+#             # CASE A: Use precomputed D (no KDE) - "like them"
+#             # ---------------------------------------------------------
+#             if Global_D is not None and domain_lengths is not None:
+#                 print("✅ Using PRECOMPUTED Global D (sliced) instead of KDE.")
+#                 Y, D, H = build_YDH_with_precomputed_D(
+#                     target_domains=target,
+#                     seed=seed,
+#                     classifiers=classifiers,
+#                     Global_D=Global_D,
+#                     domain_lengths=domain_lengths
+#                 )
+#
+#             # ---------------------------------------------------------
+#             # CASE B: Fallback: KDE (your existing pipeline)
+#             # ---------------------------------------------------------
+#             else:
+#                 el = []
+#                 for d in target:
+#                     _, l, _ = Data.get_data_loaders(d, seed=seed)
+#                     el.append((d, l))
+#                 Y, D, H = build_DP_model_Classes(
+#                     el,
+#                     sum(len(l.dataset) for _, l in el),
+#                     target,
+#                     models,
+#                     classifiers,
+#                     normalize_factors,
+#                     vae_norm_stats
+#                 )
+#             fp.write(run_baselines(Y, D, H, target, target, all_source_domains, seed))
+#             print(f" [Solver] Launching parallel workers for {target}...")
+#             results = Parallel(n_jobs=2, verbose=10)(
+#                 delayed(run_solver_sweep_worker)(Y, D, H, e, target, all_source_domains)
+#                 for e in [1.0, 1.1, 2]
+#             )
+#             for r in results:
+#                 fp.write(r)
+#             fp.flush()
+#             print(f"✅ Finished target: {target}")
+
+
 def task_run(classifiers, all_source_domains):
     seed = 1
     torch.manual_seed(seed)
     np.random.seed(seed)
+
+    # Updated path to reflect the ratio mode in the filename
     test_path = f'./results_{DATASET_MODE}_recreate/seed_{seed}/'
     os.makedirs(test_path, exist_ok=True)
 
     if USE_PRECOMPUTED_D is False:
         models, normalize_factors, vae_norm_stats = handle_vae_models(all_source_domains, classifiers, seed)
 
-    # --- Precomputed D initialization (optional) ---
+    # --- Precomputed D initialization ---
     Global_D = None
     domain_lengths = None
     if USE_PRECOMPUTED_D and os.path.exists(D_PRECOMP_PATH):
@@ -513,31 +639,21 @@ def task_run(classifiers, all_source_domains):
             domain_lengths = compute_domain_lengths(all_source_domains)
 
     print("\n--- Starting Target Combinations ---")
-    with open(os.path.join(test_path, f'Sweep_Results_{seed}_PRE_D_{USE_PRECOMPUTED_D}.txt'), 'a') as fp:
+    filename = f'Sweep_Results_{seed}_PRE_D_{USE_PRECOMPUTED_D}_art_ratios_{USE_ARTIFICIAL_RATIOS}.txt'
+
+    with open(os.path.join(test_path, filename), 'a') as fp:
         for target in [list(s) for r in range(2, len(all_source_domains) + 1) for s in
                        itertools.combinations(all_source_domains, r)]:
-            if set(target) in ({'MNIST', 'USPS'}): #, {'MNIST', 'SVHN'}):
-                print("skip " + str(set(target)))
-                continue
+
+            # Use sorted tuple to match the TARGET_RATIOS_CONFIG keys reliably
+            target_tuple = tuple(sorted(target))
 
             print(f"\n[TARGET] Starting run for: {target}")
-            total_s = sum([TEST_SET_SIZES.get(d, 0) for d in target])
-            true_r = map_weights_to_full_source_list(
-                np.array([TEST_SET_SIZES.get(d, 0) / total_s if total_s > 0 else 0 for d in target]),
-                target,
-                all_source_domains
-            )
-
-            fp.write(f"\n{'=' * 120}\nTARGET: {target} | TRUE RATIOS: {np.round(true_r, 4)}\n{'=' * 120}\n")
-            fp.write(
-                f"{'Solver':<18} | {'Epsilon Mult':<15} | {'Delta Mult':<15} | {'Acc (%)':<12} | {'Learned Weights'}\n" +
-                "-" * 120 + "\n"
-            )
 
             # ---------------------------------------------------------
-            # CASE A: Use precomputed D (no KDE) - "like them"
+            # 1. Build Initial Matrices (Full Size)
             # ---------------------------------------------------------
-            if Global_D is not None and domain_lengths is not None:
+            if Global_D is not None and domain_lengths is not None and USE_PRECOMPUTED_D:
                 print("✅ Using PRECOMPUTED Global D (sliced) instead of KDE.")
                 Y, D, H = build_YDH_with_precomputed_D(
                     target_domains=target,
@@ -546,10 +662,6 @@ def task_run(classifiers, all_source_domains):
                     Global_D=Global_D,
                     domain_lengths=domain_lengths
                 )
-
-            # ---------------------------------------------------------
-            # CASE B: Fallback: KDE (your existing pipeline)
-            # ---------------------------------------------------------
             else:
                 el = []
                 for d in target:
@@ -564,17 +676,51 @@ def task_run(classifiers, all_source_domains):
                     normalize_factors,
                     vae_norm_stats
                 )
-            fp.write(run_baselines(Y, D, H, target, target, all_source_domains, seed))
+
+            # ---------------------------------------------------------
+            # 2. Apply Artificial Ratios (Subsampling Logic)
+            # ---------------------------------------------------------
+            if USE_ARTIFICIAL_RATIOS and target_tuple in TARGET_RATIOS_CONFIG:
+                custom_ratios = TARGET_RATIOS_CONFIG[target_tuple]
+                print(f" ⚠️ Flag USE_ARTIFICIAL_RATIOS is ON. Applying: {custom_ratios}")
+
+                # Resample Y, D, H to match the requested imbalance
+                Y, D, H = apply_custom_ratios(Y, D, H, target, custom_ratios)
+
+                # Set weights based on custom configuration
+                true_r_weights = np.array([custom_ratios[d] for d in target])
+            else:
+                print(" ✅ Using natural dataset ratios.")
+                # Calculate natural weights based on original test set sizes
+                total_s = sum([TEST_SET_SIZES.get(d, 0) for d in target])
+                true_r_weights = np.array([TEST_SET_SIZES.get(d, 0) / total_s if total_s > 0 else 0 for d in target])
+
+            # Map the active weights to the full domain list for consistent logging
+            true_r = map_weights_to_full_source_list(true_r_weights, target, all_source_domains)
+
+            # ---------------------------------------------------------
+            # 3. Logging and Solver Execution
+            # ---------------------------------------------------------
+            fp.write(f"\n{'=' * 120}\nTARGET: {target} | TRUE RATIOS: {np.round(true_r, 4)}\n{'=' * 120}\n")
+            fp.write(
+                f"{'Solver':<18} | {'Epsilon Mult':<15} | {'Delta Mult':<15} | {'Acc (%)':<12} | {'Learned Weights'}\n" +
+                "-" * 120 + "\n"
+            )
+
+            # run_baselines will now see the modified (resampled) matrices
+            fp.write(run_baselines(Y, D, H, target, target, all_source_domains, seed, true_r_weights))
+
             print(f" [Solver] Launching parallel workers for {target}...")
             results = Parallel(n_jobs=2, verbose=10)(
                 delayed(run_solver_sweep_worker)(Y, D, H, e, target, all_source_domains)
                 for e in [1.0, 1.1, 2]
             )
+
             for r in results:
                 fp.write(r)
+
             fp.flush()
             print(f"✅ Finished target: {target}")
-
 
 def handle_vae_models(all_source_domains, classifiers, seed):
     models, normalize_factors, vae_norm_stats = {}, {}, {}
