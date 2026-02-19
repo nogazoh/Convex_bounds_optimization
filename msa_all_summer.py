@@ -38,6 +38,9 @@ if "solve_convex_problem_mosek" not in globals():
 from cvxpy_3_21 import solve_convex_problem_smoothed_kl_321
 from cvxpy_3_22 import solve_convex_problem_domain_anchored_smoothed
 from cvxpy_3_23 import solve_convex_problem_smoothed_original_p
+from cvxpy_3_31 import solve_convex_problem_smoothed_kl_331
+from cvxpy_3_32 import solve_convex_problem_domain_anchored_smoothed_332
+from cvxpy_3_33 import solve_convex_problem_smoothed_original_p_333
 
 from helpers import *
 
@@ -49,7 +52,7 @@ torch.set_num_threads(1)
 # ==========================================
 # --- CONFIGURATION ---
 # ==========================================
-DATASET_MODE = "DIGITS"# "DIGITS" #"OFFICE224" #"OFFICE31"
+DATASET_MODE = "DIGITS"# "DIGITS" #"OFFICE224"V #"OFFICE31" V
 USE_PRECOMPUTED_D = True
 USE_ARTIFICIAL_RATIOS = True
 
@@ -406,50 +409,99 @@ def run_baselines(Y, D, H, source_domains, target_domains, all_source_domains, s
 def run_solver_sweep_worker(Y, D, H, eps_mult, source_domains, all_source_domains):
     print(f" [Worker] Starting sweep for Epsilon Mult: {eps_mult}")
     buf = io.StringIO()
+
     errors = np.array([(SOURCE_ERRORS.get(d, 0.1) + 0.05) * eps_mult for d in source_domains])
     max_ent = np.log(len(source_domains)) if len(source_domains) > 1 else 0.1
-    for solver in ["3.21", "3.22", "3.23", "CVXPY_GLOBAL"]:  # ,"CVXPY_GLOBAL", "CVXPY_PER_DOMAIN"
-        for mult in [1.0]:#, 1.2]:
+
+    SOLVERS = ["3.21", "3.22", "3.23", "CVXPY_GLOBAL", "3.31", "3.32", "3.33"]
+    BACKENDS = ["SCS", "MOSEK"]   # <- run both
+    DELTA_MULTS = [1.0, 1.2]
+
+    for solver in SOLVERS:
+        for mult in DELTA_MULTS:
             delta = mult * max_ent
-            try:
-                if solver == "CVXPY_GLOBAL":
-                    w, Q = solve_convex_problem_mosek(Y, D, H, delta=delta, epsilon=max(errors), solver_type='SCS')
-                    if w is None:
-                        print("[CVXPY] Returned None (likely infeasible)")
+
+            for backend in BACKENDS:
+                try:
+                    # ----------------------------
+                    # solve
+                    # ----------------------------
+                    if solver == "CVXPY_GLOBAL":
+                        w, Q = solve_convex_problem_mosek(
+                            Y, D, H,
+                            delta=delta,
+                            epsilon=float(np.max(errors)),
+                            solver_type=backend
+                        )
+                    elif solver == "3.21":
+                        w, Q = solve_convex_problem_smoothed_kl_321(
+                            Y, D, H,
+                            epsilon=float(np.max(errors)),
+                            solver_type=backend
+                        )
+                    elif solver == "3.22":
+                        w, Q = solve_convex_problem_domain_anchored_smoothed(
+                            Y, D, H,
+                            epsilon=float(np.max(errors)),
+                            solver_type=backend
+                        )
+                    elif solver == "3.23":
+                        w, Q = solve_convex_problem_smoothed_original_p(
+                            Y, D, H,
+                            epsilon=float(np.max(errors)),
+                            solver_type=backend
+                        )
+                    elif solver == "3.31":
+                        w, Q = solve_convex_problem_smoothed_kl_331(
+                            Y, D, H,
+                            epsilon=float(np.max(errors)),
+                            solver_type=backend
+                        )
+                    elif solver == "3.32":
+                        w, Q = solve_convex_problem_domain_anchored_smoothed_332(
+                            Y, D, H,
+                            epsilon=float(np.max(errors)),
+                            solver_type=backend
+                        )
+                    elif solver == "3.33":
+                        w, Q = solve_convex_problem_smoothed_original_p_333(
+                            Y, D, H,
+                            epsilon=float(np.max(errors)),
+                            solver_type=backend
+                        )
+
+                    else:
+                        w, Q = solve_convex_problem_per_domain(
+                            Y, D, H,
+                            delta=np.full(len(source_domains), delta),
+                            epsilon=errors,
+                            solver_type=backend
+                        )
+
+                    if w is None or Q is None:
+                        buf.write(f"[{solver}/{backend}] Returned None (likely infeasible)\n")
                         continue
-                elif solver == "3.21":
-                    w, Q = solve_convex_problem_smoothed_kl_321(Y, D, H, epsilon=max(errors), solver_type='SCS')
-                    if w is None:
-                        print("[3.21] Returned None (likely infeasible)")
-                        continue
-                elif solver == "3.22":
-                    w, Q = solve_convex_problem_domain_anchored_smoothed(Y, D, H, epsilon=max(errors), solver_type='SCS')
-                    if w is None:
-                        print("[3.22] Returned None (likely infeasible)")
-                        continue
-                elif solver == "3.23":
-                    w, Q = solve_convex_problem_smoothed_original_p(Y, D, H, epsilon=max(errors), solver_type='SCS')
-                    if w is None:
-                        print("[3.23] Returned None (likely infeasible)")
-                        continue
-                else:
-                    w, Q = solve_convex_problem_per_domain(
-                        Y, D, H,
-                        delta=np.full(len(source_domains), delta),
-                        epsilon=errors,
-                        solver_type='SCS'
+
+                    # ----------------------------
+                    # evaluate (same code path!)
+                    # ----------------------------
+                    acc_w = evaluate_accuracy_wd(w, D, H, Y)
+                    acc_q = evaluate_accuracy_q(Q, H, Y)
+
+                    w_f = map_weights_to_full_source_list(w, source_domains, all_source_domains)
+
+                    # print with backend explicitly + full precision weights (optional)
+                    buf.write(
+                        f"{solver:<12} | {backend:<5} | m:{eps_mult:<4} | d_m:{mult:<3} "
+                        f"| acc_W: {acc_w:>6.2f} | acc_Q: {acc_q:>6.2f} | W: {np.array2string(w_f, precision=6)}\n"
                     )
-                acc_w = evaluate_accuracy_wd(w, D, H, Y)
-                acc_Q = evaluate_accuracy_q(Q, H, Y)
-                w_f = map_weights_to_full_source_list(w, source_domains, all_source_domains)
-                buf.write(f"{solver:<18} | m:{eps_mult:<13} | m:{mult:<13} | acc_W: {acc_w:<12.2f} | {str(np.round(w_f, 4))}\n")
-                buf.write(
-                    f"{solver:<18} | m:{eps_mult:<13} | m:{mult:<13} | acc_Q: {acc_Q:<12.2f} | {str(np.round(w_f, 4))}\n")
-            except Exception as e:
-                tb = traceback.format_exc()
-                msg = f"[{solver}] ERROR eps_mult={eps_mult} delta_mult={mult}: {repr(e)}\n{tb}\n"
-                print(msg)
-                buf.write(msg)
+
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    msg = f"[{solver}/{backend}] ERROR eps_mult={eps_mult} delta_mult={mult}: {repr(e)}\n{tb}\n"
+                    print(msg)
+                    buf.write(msg)
+
     return buf.getvalue()
 
 
@@ -624,7 +676,7 @@ def task_run(classifiers, all_source_domains):
     np.random.seed(seed)
 
     # Updated path to reflect the ratio mode in the filename
-    test_path = f'./results_{DATASET_MODE}_recreate/seed_{seed}/'
+    test_path = f'./results_{DATASET_MODE}_mosek/seed_{seed}/'
     os.makedirs(test_path, exist_ok=True)
 
     if USE_PRECOMPUTED_D is False:

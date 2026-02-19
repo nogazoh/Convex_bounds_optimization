@@ -13,6 +13,24 @@ from torch.utils.data import DataLoader, Subset
 from torchvision import models, transforms, datasets
 from scipy.special import logsumexp
 
+
+# ==========================================
+# --- JSD MODE FLAG ---
+# ==========================================
+# Choose how to estimate JSD:
+#   "REAL" -> use real Z from the test set (may yield negative values due to model mismatch)
+#   "GMM"  -> sample Z directly from the GMMs (JSD should be >= 0 up to MC noise)
+JSD_ESTIMATION_MODE = "GMM"   # <-- change to "REAL" if you want the old behavior
+JSD_NUM_SAMPLES = 2000        # samples per distribution when mode="GMM"
+JSD_SEED = 0                  # reproducibility
+JSD_CLIP_AT_ZERO = True       # clip tiny negative due to Monte-Carlo noise (recommended for "GMM")
+
+# --- JSD MIX WEIGHTS FLAG ---
+# "EQUAL" -> alpha=0.5 always
+# "TRUE"  -> alpha is taken from TRUE RATIOS in the results file (normalized to the pair)
+JSD_MIX_WEIGHTS_MODE = "TRUE"   # "EQUAL" or "TRUE"
+JSD_NORMALIZE_BY_WEIGHT_ENTROPY = False  # optional: divide by H([a,1-a]) to make comparable across mixes
+
 # ==========================================
 # --- CONFIGURATION ---
 # ==========================================
@@ -43,7 +61,7 @@ DATASET_CONFIGS = {
     }
 }
 
-OUTPUT_DIR = os.path.join(BASE_EXP_DIR, "analysis", "final_solver_analysis_strict_v5_oracle")
+OUTPUT_DIR = os.path.join(BASE_EXP_DIR, "analysis", "solver_analysis_sampled_data_w")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -160,26 +178,14 @@ def get_real_z(dataset_name, classifiers, scaler, pca):
     return z_data
 
 
-def calculate_empirical_jsd(gmm_p, gmm_q, Z_p, Z_q):
-    n_max = 2000
-    if len(Z_p) > n_max: Z_p = Z_p[np.random.choice(len(Z_p), n_max, replace=False)]
-    if len(Z_q) > n_max: Z_q = Z_q[np.random.choice(len(Z_q), n_max, replace=False)]
-    ll_p_xp = gmm_p.score_samples(Z_p)
-    ll_q_xp = gmm_q.score_samples(Z_p)
-    ll_p_xq = gmm_p.score_samples(Z_q)
-    ll_q_xq = gmm_q.score_samples(Z_q)
-    log_m_xp = -np.log(2) + np.logaddexp(ll_p_xp, ll_q_xp)
-    log_m_xq = -np.log(2) + np.logaddexp(ll_p_xq, ll_q_xq)
-    kl_p_m = np.mean(ll_p_xp - log_m_xp)
-    kl_q_m = np.mean(ll_q_xq - log_m_xq)
-    return 0.5 * kl_p_m + 0.5 * kl_q_m
+import re
+import numpy as np
+import ast
+import os
 
-
-# ==========================================
-# --- PARSING RESULTS (STRICT + ORACLE) ---
-# ==========================================
 def parse_results_strict(filepath):
-    if not os.path.exists(filepath): return []
+    if not os.path.exists(filepath):
+        return []
     with open(filepath, 'r') as f:
         content = f.read()
 
@@ -190,10 +196,22 @@ def parse_results_strict(filepath):
 
     for block in blocks:
         lines = block.strip().split('\n')
+        header = lines[0].strip()
+
+        # --- parse header line robustly ---
+        # Example:
+        # "['amazon', 'dslr'] | TRUE RATIOS: [0.2 0.8 0. ]"
         try:
-            target_str = lines[0].split('|')[0].strip()
-            target_list = ast.literal_eval(target_str)
-            if len(target_list) != 2: continue
+            left, right = header.split("| TRUE RATIOS:")
+            target_list = ast.literal_eval(left.strip())
+
+            # ratios may come without commas => parse floats via regex
+            ratio_str = right.strip()
+            nums = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", ratio_str)
+            true_ratios = np.array([float(x) for x in nums], dtype=float)
+
+            if len(target_list) < 2 or true_ratios.size == 0:
+                continue
             target_set = frozenset(target_list)
         except:
             continue
@@ -208,7 +226,6 @@ def parse_results_strict(filepath):
                     name = parts[0]
                     acc_str = parts[3]
                     try:
-                        val = 0.0
                         if 'acc_' in acc_str:
                             val = float(acc_str.split(':')[1])
                         elif '±' in acc_str:
@@ -218,28 +235,22 @@ def parse_results_strict(filepath):
 
                         if name not in scores or val > scores[name]:
                             scores[name] = val
-
-                        if "DC" in name: dc_vals.append(val)
+                        if "DC" in name:
+                            dc_vals.append(val)
                     except:
                         pass
 
         uniform = scores.get("UNIFORM")
-        oracle = scores.get("ORACLE")  # Exact Match Oracle (Not ANY CORRECT)
+        oracle  = scores.get("ORACLE")
 
-        # 1. Best New Solver (Excluding Baseline & DC)
         best_new_solver_acc = -1
         best_new_solver_name = "None"
-
         for name, val in scores.items():
-            is_baseline = name in BASELINE_NAMES
-            is_dc = "DC" in name
-
-            if not is_baseline and not is_dc:
+            if (name not in BASELINE_NAMES) and ("DC" not in name):
                 if val > best_new_solver_acc:
                     best_new_solver_acc = val
                     best_new_solver_name = name
 
-        # 2. Worst DC
         worst_dc = min(dc_vals) if dc_vals else None
 
         if uniform is not None and best_new_solver_acc > 0:
@@ -249,6 +260,8 @@ def parse_results_strict(filepath):
 
             data.append({
                 "Target_Set": target_set,
+                "Target_List": target_list,
+                "True_Ratios": true_ratios,
                 "Label": label,
                 "Dataset": "Unknown",
                 "Acc_Uniform": uniform,
@@ -256,8 +269,6 @@ def parse_results_strict(filepath):
                 "Acc_Best_New": best_new_solver_acc,
                 "Acc_Worst_DC": worst_dc,
                 "Solver_Name": best_new_solver_name,
-
-                # Metrics
                 "Gain_Uniform": best_new_solver_acc - uniform,
                 "Gain_Worst_DC": (best_new_solver_acc - worst_dc) if worst_dc is not None else None,
                 "Gain_Oracle": (best_new_solver_acc - oracle) if oracle is not None else None
@@ -267,7 +278,7 @@ def parse_results_strict(filepath):
 
 
 # ==========================================
-# --- PLOTTING ---
+# --- PARSING RESULTS (STRICT + ORACLE) ---
 # ==========================================
 def plot_with_regression(df, y_col, y_label, title, filename):
     plt.figure(figsize=(12, 8))
@@ -285,15 +296,15 @@ def plot_with_regression(df, y_col, y_label, title, filename):
     )
 
     # Regression
-    for ds in datasets:
-        subset = df[df['Dataset'] == ds]
-        if len(subset) > 1 and subset['JSD'].nunique() > 1:
-            sns.regplot(
-                data=subset, x='JSD', y=y_col, scatter=False,
-                color=color_map[ds], ax=plt.gca(), ci=None,
-                line_kws={'linestyle': '--', 'linewidth': 2, 'alpha': 0.7},
-                truncate=False
-            )
+    # for ds in datasets:
+    #     subset = df[df['Dataset'] == ds]
+    #     if len(subset) > 1 and subset['JSD'].nunique() > 1:
+    #         sns.regplot(
+    #             data=subset, x='JSD', y=y_col, scatter=False,
+    #             color=color_map[ds], ax=plt.gca(), ci=None,
+    #             line_kws={'linestyle': '--', 'linewidth': 2, 'alpha': 0.7},
+    #             truncate=False
+    #         )
 
     # Baseline (0) if Gain
     if "Gain" in y_col:
@@ -326,6 +337,121 @@ def plot_with_regression(df, y_col, y_label, title, filename):
 
 
 # ==========================================
+# --- PLOTTING ---
+# def calculate_empirical_jsd(gmm_p, gmm_q, Z_p, Z_q):
+#     n_max = 2000
+#     if len(Z_p) > n_max: Z_p = Z_p[np.random.choice(len(Z_p), n_max, replace=False)]
+#     if len(Z_q) > n_max: Z_q = Z_q[np.random.choice(len(Z_q), n_max, replace=False)]
+#     ll_p_xp = gmm_p.score_samples(Z_p)
+#     ll_q_xp = gmm_q.score_samples(Z_p)
+#     ll_p_xq = gmm_p.score_samples(Z_q)
+#     ll_q_xq = gmm_q.score_samples(Z_q)
+#     log_m_xp = -np.log(2) + np.logaddexp(ll_p_xp, ll_q_xp)
+#     log_m_xq = -np.log(2) + np.logaddexp(ll_p_xq, ll_q_xq)
+#     kl_p_m = np.mean(ll_p_xp - log_m_xp)
+#     kl_q_m = np.mean(ll_q_xq - log_m_xq)
+#     return 0.5 * kl_p_m + 0.5 * kl_q_m
+
+def _entropy_2(a):
+    a = float(a)
+    b = 1.0 - a
+    eps = 1e-15
+    a = np.clip(a, eps, 1 - eps)
+    b = np.clip(b, eps, 1 - eps)
+    return - (a * np.log(a) + b * np.log(b))
+
+def _jsd_from_loglikes(ll_p_xp, ll_q_xp, ll_p_xq, ll_q_xq, alpha=0.5, normalize=False):
+    """
+    Weighted JSD:
+      M = alpha P + (1-alpha) Q
+      JSD = alpha * E_{x~P}[log p - log m] + (1-alpha) * E_{x~Q}[log q - log m]
+    """
+    eps = 1e-15
+    a = float(np.clip(alpha, eps, 1 - eps))
+    b = 1.0 - a
+
+    # log m(x) = log( a * p(x) + b * q(x) )
+    log_m_xp = np.logaddexp(np.log(a) + ll_p_xp, np.log(b) + ll_q_xp)
+    log_m_xq = np.logaddexp(np.log(a) + ll_p_xq, np.log(b) + ll_q_xq)
+
+    kl_p_m = np.mean(ll_p_xp - log_m_xp)  # E_{P}[log p - log m]
+    kl_q_m = np.mean(ll_q_xq - log_m_xq)  # E_{Q}[log q - log m]
+
+    jsd = a * kl_p_m + b * kl_q_m
+
+    if normalize:
+        H = _entropy_2(a)          # upper bound of weighted JSD
+        jsd = jsd / max(H, 1e-12)  # avoid div by 0
+
+    return float(jsd)
+
+
+
+def calculate_jsd(gmm_p, gmm_q, Z_p=None, Z_q=None,
+                  mode="REAL", n_samples=2000, seed=0,
+                  clip_at_zero=False, alpha=0.5, normalize=False):
+
+    rng = np.random.RandomState(seed)
+
+    if mode.upper() == "REAL":
+        if Z_p is None or Z_q is None:
+            raise ValueError("REAL mode requires Z_p and Z_q.")
+        if len(Z_p) > n_samples:
+            Z_p = Z_p[rng.choice(len(Z_p), n_samples, replace=False)]
+        if len(Z_q) > n_samples:
+            Z_q = Z_q[rng.choice(len(Z_q), n_samples, replace=False)]
+
+        ll_p_xp = gmm_p.score_samples(Z_p)
+        ll_q_xp = gmm_q.score_samples(Z_p)
+        ll_p_xq = gmm_p.score_samples(Z_q)
+        ll_q_xq = gmm_q.score_samples(Z_q)
+
+        jsd = _jsd_from_loglikes(ll_p_xp, ll_q_xp, ll_p_xq, ll_q_xq, alpha=alpha, normalize=normalize)
+
+    elif mode.upper() == "GMM":
+        gmm_p.random_state = seed
+        gmm_q.random_state = seed + 1
+
+        Xp, _ = gmm_p.sample(n_samples)
+        Xq, _ = gmm_q.sample(n_samples)
+
+        ll_p_xp = gmm_p.score_samples(Xp)
+        ll_q_xp = gmm_q.score_samples(Xp)
+        ll_p_xq = gmm_p.score_samples(Xq)
+        ll_q_xq = gmm_q.score_samples(Xq)
+
+        jsd = _jsd_from_loglikes(ll_p_xp, ll_q_xp, ll_p_xq, ll_q_xq, alpha=alpha, normalize=normalize)
+
+    else:
+        raise ValueError(f"Unknown mode={mode}. Use 'REAL' or 'GMM'.")
+
+    if clip_at_zero:
+        jsd = max(0.0, float(jsd))
+
+    return float(jsd)
+
+# ==========================================
+
+def sanity_check_jsd_xx(gmms, real_z=None, mode="GMM"):
+    print("\n🔎 Sanity check: JSD(X, X) should be ~0")
+    for d, gmm in gmms.items():
+        try:
+            if mode.upper() == "REAL":
+                if real_z is None or d not in real_z:
+                    print(f"   {d}: (skipped - no real Z)")
+                    continue
+                val = calculate_jsd(gmm, gmm, Z_p=real_z[d], Z_q=real_z[d],
+                                    mode="REAL", n_samples=JSD_NUM_SAMPLES, seed=JSD_SEED,
+                                    clip_at_zero=False)
+            else:
+                val = calculate_jsd(gmm, gmm, mode="GMM",
+                                    n_samples=JSD_NUM_SAMPLES, seed=JSD_SEED,
+                                    clip_at_zero=JSD_CLIP_AT_ZERO)
+            print(f"   {d}: JSD({d},{d}) = {val:.6f}")
+        except Exception as e:
+            print(f"   {d}: ERROR {repr(e)}")
+
+# ==========================================
 # --- MAIN ---
 # ==========================================
 def main():
@@ -335,17 +461,65 @@ def main():
     for mode in ["OFFICE31", "OFFICE224"]:
         print(f"\n--- Processing {mode} ---")
         clf, scaler, pca, gmms = load_assets(mode)
-        if not clf: continue
+        if not clf:
+            continue
 
         real_z = get_real_z(mode, clf, scaler, pca)
         results = parse_results_strict(DATASET_CONFIGS[mode]['RESULTS_FILE'])
+        # --- Sanity check JSD(X,X) ---
+        sanity_check_jsd_xx(gmms, real_z=real_z, mode=JSD_ESTIMATION_MODE)
 
         for res in results:
-            t_list = list(res['Target_Set'])
-            d1, d2 = t_list[0], t_list[1]
+            # ✅ use ordered list from file (not set)
+            t_list = res.get("Target_List", None)
+            if not t_list:
+                t_list = list(res["Target_Set"])
+
+            # ✅ keep only true 2-domain mixes
+            if len(t_list) != 2:
+                continue
+
+            d1 = str(t_list[0]).strip()
+            d2 = str(t_list[1]).strip()
 
             if d1 in real_z and d2 in real_z:
-                jsd_val = calculate_empirical_jsd(gmms[d1], gmms[d2], real_z[d1], real_z[d2])
+                # -------------------------------
+                # NEW: choose alpha (mix weight) for weighted JSD
+                # -------------------------------
+                alpha = 0.5  # default: equal mix
+                if JSD_MIX_WEIGHTS_MODE.upper() == "TRUE":
+                    ratios = res.get("True_Ratios", None)  # <-- correct key name
+                    if ratios is not None:
+                        all_domains = DATASET_CONFIGS[mode]["DOMAINS"]
+                        try:
+                            idx1 = all_domains.index(d1)
+                            idx2 = all_domains.index(d2)
+                            r1 = float(ratios[idx1])
+                            r2 = float(ratios[idx2])
+                            s = r1 + r2
+                            alpha = (r1 / s) if s > 0 else 0.5
+                        except Exception:
+                            alpha = 0.5  # fallback safely
+
+                # jsd_val = calculate_empirical_jsd(gmms[d1], gmms[d2], real_z[d1], real_z[d2])
+                if JSD_ESTIMATION_MODE.upper() == "REAL":
+                    jsd_val = calculate_jsd(
+                        gmms[d1], gmms[d2],
+                        Z_p=real_z[d1], Z_q=real_z[d2],
+                        mode="REAL", n_samples=JSD_NUM_SAMPLES, seed=JSD_SEED,
+                        clip_at_zero=False,  # keep raw (can be negative)
+                        alpha=alpha,
+                        normalize=JSD_NORMALIZE_BY_WEIGHT_ENTROPY
+                    )
+                else:
+                    jsd_val = calculate_jsd(
+                        gmms[d1], gmms[d2],
+                        mode="GMM", n_samples=JSD_NUM_SAMPLES, seed=JSD_SEED,
+                        clip_at_zero=JSD_CLIP_AT_ZERO,
+                        alpha=alpha,
+                        normalize=JSD_NORMALIZE_BY_WEIGHT_ENTROPY
+                    )
+
                 res['JSD'] = jsd_val
                 res['Dataset'] = mode
                 all_rows.append(res)
