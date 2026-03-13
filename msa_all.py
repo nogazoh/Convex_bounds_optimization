@@ -1,568 +1,277 @@
-from __future__ import print_function
-import time
-import torch.utils.data
-import glob
-import logging
-from sklearn.metrics import accuracy_score
-import pandas as pd
-import numpy as np
-from scipy import stats
-from sklearn.neighbors import KernelDensity
-from sklearn.model_selection import GridSearchCV
-import os
-from joblib import Parallel, delayed
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset, Subset
+import numpy as np
+import os
+import io
+import itertools
+import time
+from joblib import Parallel, delayed
+from sklearn.metrics import accuracy_score
+from torchvision import models
 
-# --- YOUR LOCAL MODULES ---
+# --- CUSTOM MODULES ---
 from dc import *
-import classifier as ClSFR
-import matplotlib.pyplot as plt
-from vae import *
+from vae_latent_est import vr_model, load_feature_dataset
 import data as Data
 
-# --- IMPORTS FOR SOLVERS ---
-from cvxpy_solver import solve_convex_problem_mosek
-from cvxpy_solver_per_domain import solve_convex_problem_per_domain
+# ניסיון ייבוא פונקציות הסולבר מהקבצים החיצוניים
+try:
+    from cvxpy_solver import solve_convex_problem_mosek
+    from cvxpy_solver_per_domain import solve_convex_problem_per_domain
+except ImportError:
+    print("[!] Warning: Solver functions not found in external files. Ensure dc.py or cvxpy_solver.py are present.")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("device = ", device)
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-torch.set_num_threads(1)
 
-# Global Cache to prevent re-running same solver configs multiple times
-Z_MEMORY_CACHE = {}
+# ==========================================
+# --- CONFIGURATION ---
+# ==========================================
+NUM_CLASSES = 65
+BASE_EXP_DIR = "./Experiments_SeparatePCA"
+UNIFIED_DIM = 1941  # הממד שנקבע בשלב ה-PCA
+
+FLAGS = {
+    "INCLUDE_TARGET_IN_SOURCES": True,
+    "MIN_TARGET_GROUP_SIZE": 2,
+    "MAX_TARGET_GROUP_SIZE": 4,
+    "N_SWEEP_STEPS": 5,
+    "N_JOBS": 2,
+    "TARGET_SAMPLE_SIZE": 1200
+}
+
+ERROR_MATRIX = {
+    'Art': {'Art': 0.0535, 'Clipart': 0.5979, 'Product': 0.4527, 'Real World': 0.3349},
+    'Clipart': {'Art': 0.5309, 'Clipart': 0.0435, 'Product': 0.4403, 'Real World': 0.3796},
+    'Product': {'Art': 0.5802, 'Clipart': 0.6037, 'Product': 0.0169, 'Real World': 0.3200},
+    'Real World': {'Art': 0.3930, 'Clipart': 0.5624, 'Product': 0.2646, 'Real World': 0.0310}
+}
 
 
-def calculate_expected_loss_local(Y, H, D, num_sources):
+# ==========================================
+# --- CORE LOGIC: ON-THE-FLY MATRIX BUILD ---
+# ==========================================
+
+def get_clear_imbalanced_ratios(k):
+    if k == 1: return [1.0]
+    ratios = np.geomspace(1, 4, num=k)
+    return (ratios / ratios.sum()).tolist()
+
+
+def build_DP_matrices(target_info, source_domains, classifiers):
     """
-    Calculates the expected loss matrix.
+    מחשב את D (Confidence מה-VAE) ואת H (תחזיות הקלאסיפייר) בזמן אמת.
+    כולל דיבוג עמוק לאי-יתכנות (Infeasibility).
     """
-    L_mat = np.zeros((num_sources, num_sources))
-    for j in range(num_sources):
-        if H.ndim == 3:
-            pred_j = H[:, :, j]
-        else:
-            pred_j = H[:, j]
+    total_samples = sum(len(idx) for _, _, idx in target_info)
+    K = len(source_domains)
+    all_possible_sources = ['Art', 'Clipart', 'Product', 'Real World']
 
-        loss_vec = np.abs(pred_j - Y)
+    Y = np.zeros((total_samples, NUM_CLASSES))
+    D = np.zeros((total_samples, NUM_CLASSES, K))
+    H = np.zeros((total_samples, NUM_CLASSES, K))
 
-        for t in range(num_sources):
-            if D.ndim == 3:
-                p_t = D[:, :, t]
-            else:
-                p_t = D[:, t]
-            L_mat[j, t] = np.sum(p_t * loss_vec)
-    return L_mat
+    # טעינת מודלי VAE לזיכרון
+    vae_models = {}
+    for src in all_possible_sources:
+        model_path = os.path.join(BASE_EXP_DIR, src, f"vrs_{src}_model.pt")
+        if os.path.exists(model_path):
+            model = vr_model(UNIFIED_DIM, alpha_pos=0.5, alpha_neg=-0.5).to(device)
+            model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+            model.eval()
+            vae_models[src] = model
 
+    curr_global_idx = 0
+    print(f"\n   [BUILD] Starting on-the-fly calculation for {total_samples} samples...")
 
-def build_DP_model_Classes(data_loaders, data_size, source_domains, models, classifiers, test_path, normalize_factors,
-                           estimate_prob_type):
-    C = 10
-    Y = np.zeros((data_size, C))
-    D = np.zeros((data_size, C, len(source_domains)))
-    H = np.zeros((data_size, C, len(source_domains)))
+    for target_name, loader, chosen_indices in target_info:
+        pca_path = os.path.join(BASE_EXP_DIR, target_name, f"{target_name}_test.pt")
+        target_pca_all, _ = torch.load(pca_path, weights_only=True)
+        target_pca_subset = target_pca_all[chosen_indices].to(device)
 
-    i = 0
-    for target_domain, data_loader in data_loaders:
-        for data, label in data_loader:
-            data = data.to(device)
-            N = len(data)
-            y_vals = label.cpu().detach().numpy()
-            one_hot = np.zeros((y_vals.size, C))
-            one_hot[np.arange(y_vals.size), y_vals] = 1
-            Y[i:i + N] = one_hot
+        batch_count = 0
+        for imgs, labels in loader:
+            N_batch = len(imgs)
+            imgs = imgs.to(device)
+            if imgs.shape[-1] < 224:
+                imgs = F.interpolate(imgs, size=(224, 224), mode='bilinear')
 
-            for k, source_domain in enumerate(source_domains):
-                with torch.no_grad():
-                    output = classifiers[source_domain](data)
-                    norm_output = F.softmax(output, dim=1)
-                    H[i:i + N, :, k] = norm_output.cpu().detach().numpy()
+            for i in range(N_batch):
+                Y[curr_global_idx + i, labels[i]] = 1
 
-                    if estimate_prob_type == "GMSA":
-                        D[i:i + N, :, k] = output.cpu().detach().numpy()
-                    elif estimate_prob_type in ["OURS-STD-SCORE", "OURS-KDE", "OURS-STD-SCORE-WITH-KDE"]:
-                        x_hat, _, _ = models[source_domain](data)
-                        log_p = models[source_domain].compute_log_probabitility_gaussian(
-                            x_hat, data.view(data.shape[0], -1), torch.zeros_like(x_hat)
+            with torch.no_grad():
+                batch_pca = target_pca_subset[batch_count: batch_count + N_batch]
+
+                for k, src_name in enumerate(source_domains):
+                    _, logits = classifiers[src_name](imgs)
+                    H[curr_global_idx: curr_global_idx + N_batch, :, k] = F.softmax(logits, dim=1).cpu().numpy()
+
+                    if src_name in vae_models:
+                        x_hat, _, _ = vae_models[src_name](batch_pca)
+                        log_p = vae_models[src_name].compute_log_probabitility_bernoulli(x_hat, batch_pca)
+                        D[curr_global_idx: curr_global_idx + N_batch, :, k] = np.tile(
+                            log_p.cpu().numpy().reshape(-1, 1), (1, NUM_CLASSES)
                         )
-                        log_p_tile = torch.tile(log_p[:, None], (1, C))
-                        D[i:i + N, :, k] = log_p_tile.cpu().detach().numpy()
-            i += N
+            curr_global_idx += N_batch
+            batch_count += N_batch
 
-    for k, source_domain in enumerate(source_domains):
-        if estimate_prob_type == "GMSA" or estimate_prob_type == "OURS-KDE":
-            params = {"bandwidth": np.logspace(-2, 2, 40)}
-            grid = GridSearchCV(KernelDensity(), params, n_jobs=1)
-            data = D[:, :, k]
-            shuffled_indices = np.random.permutation(len(data))
-            data_shuffle = data[shuffled_indices]
-            grid.fit(data_shuffle[:2000])
-            kde = grid.best_estimator_
-            log_density = kde.score_samples(data)
-            log_density_tile = np.tile(log_density[:, None], (1, C))
-            D[:, :, k] = np.exp(log_density_tile)
-        elif estimate_prob_type in ["OURS-STD-SCORE", "OURS-STD-SCORE-WITH-KDE"]:
-            log_p_mean, log_p_std = normalize_factors[source_domain]
-            if log_p_std == 0:
-                standard_score = D[:, :, k] - log_p_mean
-            else:
-                standard_score = (D[:, :, k] - log_p_mean) / log_p_std
-            D[:, :, k] = np.exp(-np.abs(standard_score))
-            if estimate_prob_type == "OURS-STD-SCORE-WITH-KDE":
-                params = {"bandwidth": np.logspace(-2, 2, 40)}
-                grid = GridSearchCV(KernelDensity(), params, n_jobs=1)
-                data = standard_score
-                shuffled_indices = np.random.permutation(len(data))
-                data_shuffle = data[shuffled_indices]
-                grid.fit(data_shuffle[:2000])
-                kde = grid.best_estimator_
-                log_density = kde.score_samples(data)
-                log_density_tile = np.tile(log_density[:, None], (1, C))
-                D[:, :, k] = np.exp(log_density_tile)
-        D[:, :, k] = D[:, :, k] / D[:, :, k].sum()
+    # === [D-DEEP-DIAGNOSTIC] ===
+    print(f"\n   {'='*65}")
+    print(f"   [D-DEEP-DIAGNOSTIC] Analyzing Confidence Matrix")
+    print(f"   {'='*65}")
+
+    # 1. מי בחר את מי? (Dominance)
+    raw_winners = np.argmax(D[:, 0, :], axis=1)
+    unique, counts = np.unique(raw_winners, return_counts=True)
+    print(f"   -> Raw VAE Winners (Dominance):")
+    for idx, count in zip(unique, counts):
+        print(f"      {source_domains[idx]:10}: {count:4} samples ({count/total_samples:.1%})")
+
+    # 2. האם ה-VAE והקלאסיפייר מסונכרנים? (Alignment)
+    h_preds = H.argmax(1) # [Samples, Sources]
+    y_true = Y.argmax(1)
+    print(f"   -> Source Accuracy on VAE-Claimed Samples (Alignment):")
+    for k, src in enumerate(source_domains):
+        mask = (raw_winners == k)
+        if mask.any():
+            acc = (h_preds[mask, k] == y_true[mask]).mean() * 100
+            print(f"      {src:10}: {acc:.2f}% accurate on its own samples")
+
+    # 3. מרווח ביטחון (Margin Analysis)
+    sorted_D = np.sort(D[:, 0, :], axis=1)
+    avg_margin = np.mean(sorted_D[:, -1] - sorted_D[:, -2])
+    print(f"   -> Average Log-P Margin (1st vs 2nd): {avg_margin:.2f}")
+
+    # --- נורמליזציה ---
+    print("\n   [BUILD] Normalizing D matrix...")
+    for i in range(total_samples):
+        for j in range(NUM_CLASSES):
+            vec = D[i, j, :]
+            v_min, v_max = vec.min(), vec.max()
+            D[i, j, :] = (vec - v_min) / (v_max - v_min) if v_max - v_min > 1e-9 else 1.0 / K
+
+    # 4. בדיקת אנטרופיה מול Delta
+    norm_D_sample = D[:, 0, :] + 1e-9
+    norm_D_sample /= norm_D_sample.sum(axis=1, keepdims=True)
+    avg_entropy = -np.mean(np.sum(norm_D_sample * np.log(norm_D_sample), axis=1))
+    delta_limit = 1.1 * np.log(len(source_domains))
+    print(f"   -> Avg Normalized Entropy: {avg_entropy:.4f} (Delta Limit: {delta_limit:.4f})")
+    if avg_entropy < 0.1:
+        print("   [!] WARNING: Entropy is very low. This often causes INFEASIBILITY.")
+    print(f"   {'='*65}\n")
+
     return Y, D, H
 
 
-def build_DP_model(data_loaders, data_size, source_domains, models, classifiers, test_path, normalize_factors,
-                   estimate_prob_type):
-    C = 10
-    Y = np.zeros((data_size))
-    D = np.zeros((data_size, len(source_domains)))
-    H = np.zeros((data_size, len(source_domains)))
-    all_output = np.zeros((data_size, C, len(source_domains)))
+# ==========================================
+# --- SOLVER WRAPPER ---
+# ==========================================
 
-    i = 0
-    for target_domain, data_loader in data_loaders:
-        for data, label in data_loader:
-            data = data.to(device)
-            N = len(data)
-            y_vals = label.cpu().detach().numpy()
-            Y[i:i + N] = y_vals
-            for k, source_domain in enumerate(source_domains):
-                with torch.no_grad():
-                    output = classifiers[source_domain](data)
-                    norm_output = F.softmax(output, dim=1)
-                    y_pred = norm_output.data.max(1, keepdim=True)[1]
-                    y_pred = y_pred.flatten().cpu().detach().numpy()
-                    H[i:i + N, k] = y_pred
-                    if estimate_prob_type == "GMSA":
-                        all_output[i:i + N, :, k] = output.cpu().detach().numpy()
-                    elif estimate_prob_type in ["OURS-STD-SCORE", "OURS-KDE", "OURS-STD-SCORE-WITH-KDE"]:
-                        x_hat, _, _ = models[source_domain](data)
-                        log_p = models[source_domain].compute_log_probabitility_gaussian(
-                            x_hat, data.view(data.shape[0], -1), torch.zeros_like(x_hat)
-                        )
-                        D[i:i + N, k] = log_p.cpu().detach().numpy()
-            i += N
+def run_solver_at_epsilon(Y, D, H, epsilon_vec, source_domains, all_domains):
+    buf = io.StringIO()
+    max_ent = np.log(len(source_domains)) if len(source_domains) > 1 else 0.1
+    delta = 1.1 * max_ent
+    avg_eps = np.mean(epsilon_vec)
 
-    for k, source_domain in enumerate(source_domains):
-        if estimate_prob_type == "GMSA" or estimate_prob_type == "OURS-KDE":
-            if estimate_prob_type == "GMSA":
-                data = all_output[:, :, k]
-            elif estimate_prob_type == "OURS-KDE":
-                data = D[:, k]
-                data = data[:, None]
-            params = {"bandwidth": np.logspace(-2, 2, 40)}
-            grid = GridSearchCV(KernelDensity(), params, n_jobs=1)
-            shuffled_indices = np.random.permutation(len(data))
-            data_shuffle = data[shuffled_indices]
-            grid.fit(data_shuffle[:2000])
-            kde = grid.best_estimator_
-            log_density = kde.score_samples(data)
-            D[:, k] = np.exp(log_density)
-        elif estimate_prob_type == "OURS-STD-SCORE":
-            log_p_mean, log_p_std = normalize_factors[source_domain]
-            standard_score = (D[:, k] - log_p_mean) / log_p_std
-            D[:, k] = np.exp(-np.abs(standard_score))
-        D[:, k] = D[:, k] / D[:, k].sum()
-    return Y, D, H
+    print(f"\n      [SOLVER] New Step: avg_eps={avg_eps:.4f} | Delta={delta:.4f}")
+    print(f"               Eps Vector: {np.round(epsilon_vec, 4)}")
+
+    for solver_type in ["GLOBAL", "PER_DOMAIN"]:
+        try:
+            if solver_type == "GLOBAL":
+                w = solve_convex_problem_mosek(Y, D, H, delta=delta, epsilon=np.max(epsilon_vec))
+            else:
+                w = solve_convex_problem_per_domain(Y, D, H, delta=np.full(len(source_domains), delta),
+                                                    epsilon=epsilon_vec)
+
+            if w is None:
+                print(f"         !!! {solver_type:<12} | Status: INFEASIBLE")
+                buf.write(f"{solver_type:<12} | eps: {avg_eps:.4f} | INFEASIBLE\n")
+                continue
+
+            final_pred = ((D * H) * w.reshape(1, 1, -1)).sum(2).argmax(1)
+            acc = accuracy_score(Y.argmax(1), final_pred) * 100
+            w_full = np.zeros(len(all_domains))
+            for i, src in enumerate(all_domains):
+                if src in source_domains: w_full[i] = w[source_domains.index(src)]
+
+            print(f"         ✅ {solver_type:<12} | ACC: {acc:.2f}% | w: {np.round(w_full, 3)}")
+            buf.write(f"{solver_type:<12} | eps: {avg_eps:.4f} | acc: {acc:.2f}% | w: {np.round(w_full, 3)}\n")
+        except Exception as e:
+            buf.write(f"{solver_type:<12} | ERROR: {e}\n")
+    return buf.getvalue()
 
 
-def run_single_optimization(solver_name, Y, D, H, source_domains, seed, init_z_method, test_path,
-                            initial_delta_multiplier, fixed_epsilon_dict):
-    """
-    Runs solver with AUTO-RELAXATION for DELTA (KL) ONLY.
-    EPSILON (Risk) is FIXED from the CSV file and does not change.
-    """
-    global Z_MEMORY_CACHE
-    sources_key = tuple(sorted(source_domains))
-    # Cache key: Include fixed epsilons so if CSV changes, we re-run
-    cache_key = (solver_name, sources_key, seed, initial_delta_multiplier, tuple(fixed_epsilon_dict.values()))
+# ==========================================
+# --- MAIN EXECUTION ---
+# ==========================================
 
-    if cache_key in Z_MEMORY_CACHE:
-        return Z_MEMORY_CACHE[cache_key]
+def load_full_classifier(domain):
+    m = models.resnet50(weights=None)
+    m.fc = nn.Linear(m.fc.in_features, NUM_CLASSES)
+    m.load_state_dict(torch.load(f"./classifiers/{domain}_224.pt", map_location=device, weights_only=True))
 
-    k = len(source_domains)
-    # L_mat is internal to the solver logic usually, but here we enforce external bounds.
+    class ModelWrap(nn.Module):
+        def __init__(self, m):
+            super().__init__()
+            self.b = nn.Sequential(*list(m.children())[:-1])
+            self.f = m.fc
+        def forward(self, x):
+            f = torch.flatten(self.b(x), 1)
+            return f, self.f(f)
 
-    # --- PREPARE FIXED EPSILONS ---
-    # Convert dictionary to a vector ordered by source_domains
-    # Example: [Error_MNIST, Error_USPS, Error_SVHN]
-    base_eps_vec = np.array([fixed_epsilon_dict[domain] for domain in source_domains])
-
-    # --- AUTO-RELAXATION LOOP ---
-    current_delta_mult = initial_delta_multiplier
-
-    max_retries = 5
-    learned_z = None
-    BASE_DELTA = 0.1
-
-    for attempt in range(max_retries):
-        # 1. Calculate Constraints
-        # EPSILON is FIXED (No multiplier applied)
-        EPSILONS_VEC = base_eps_vec
-
-        # DELTA changes with attempts
-        DELTAS_VEC = [BASE_DELTA * current_delta_mult] * k
-
-        # For General CVXPY: Use MAX error as the single bound (Conservative)
-        SINGLE_EPS_BOUND = np.max(EPSILONS_VEC)
-        SINGLE_DELTA_BOUND = np.mean(DELTAS_VEC)
-
-        CHOSEN_BACKEND = 'SCS'
-
-        print(f"    >>> [Solver: {solver_name}] Attempt {attempt + 1}/{max_retries}")
-        print(f"        Fixed Eps Vector: {np.round(EPSILONS_VEC, 4)}")
-        print(f"        Delta Mult: {current_delta_mult:.3f} (Bound: {SINGLE_DELTA_BOUND:.4f})")
-
-        # 2. Run Specific Solver
-        if solver_name == "DC":
-            # DC typically solves the unconstrained or differently formulated problem
-            # Just keeping existing logic
-            DP = init_problem_from_model(Y, D, H, p=k, C=10)
-            prob = ConvexConcaveProblem(DP)
-            solver = ConvexConcaveSolver(prob, seed, init_z_method)
-            z_res, _, _ = solver.solve()
-            learned_z = z_res
-            break
-
-        elif solver_name == "CVXPY":
-            try:
-                # GENERAL CASE: Use MAX error as the bound
-                learned_z = solve_convex_problem_mosek(
-                    Y, D, H, delta=SINGLE_DELTA_BOUND, epsilon=SINGLE_EPS_BOUND, solver_type=CHOSEN_BACKEND
-                )
-                if not np.allclose(learned_z, np.ones(k) / k, atol=1e-3):
-                    print("        -> Success!")
-                    break
-            except Exception as e:
-                print(f"        -> Failed: {e}")
-
-        elif solver_name == "CVXPY_PER_DOMAIN":
-            try:
-                # PER DOMAIN CASE: Use the specific error vector
-                learned_z = solve_convex_problem_per_domain(
-                    Y, D, H, delta=DELTAS_VEC, epsilon=EPSILONS_VEC, solver_type=CHOSEN_BACKEND
-                )
-                if not np.allclose(learned_z, np.ones(k) / k, atol=1e-3):
-                    print("        -> Success!")
-                    break
-            except Exception as e:
-                print(f"        -> Failed: {e}")
-
-        # 3. Relaxation Logic (Only Delta changes)
-        print("        -> Solver returned uniform/failed. Relaxing DELTA constraint...")
-        current_delta_mult *= 1.20  # Aggressive relaxation for Delta since Eps is fixed
-
-    if learned_z is None:
-        learned_z = np.ones(k) / k
-
-    # Note: We return 1.0 as eps_mult just for logging consistency, though it wasn't used
-    result_tuple = (learned_z, 1.0, current_delta_mult)
-    Z_MEMORY_CACHE[cache_key] = result_tuple
-
-    return result_tuple
-
-
-def evaluate_z_on_data(Y, D, H, learned_z, multi_dim, source_domains):
-    DP = init_problem_from_model(Y, D, H, p=len(source_domains), C=10)
-    prob = ConvexConcaveProblem(DP)
-    _, _, _, hz = prob.compute_DzJzKzhz(learned_z)
-    if multi_dim:
-        Y_true = Y.argmax(axis=1)
-        hz_pred = hz.argmax(axis=1)
-    else:
-        Y_true = Y
-        hz_pred = hz
-    correct = np.sum(Y_true == hz_pred)
-    total = len(Y_true)
-    return correct, total
-
-
-def task_run(date, seed, estimate_prob_type, init_z_method, multi_dim,
-             model_type, pos_alpha, neg_alpha,
-             classifiers, source_domains, delta_multiplier, fixed_epsilon_dict):
-    # --- FIX: Shorten Folder Names for Windows ---
-    prob_type_short = {
-        "OURS-STD-SCORE-WITH-KDE": "KDE",
-        "OURS-STD-SCORE": "STD",
-        "GMSA": "GMSA"
-    }.get(estimate_prob_type, "Unk")
-
-    # Shorter Path Structure
-    # Note: Eps is fixed, so we just log "FixedEps" in the folder name to avoid confusion
-    relative_path = (
-        f'./Res_{date}_FixedEps_d{delta_multiplier}/'
-        f'{prob_type_short}/'
-        f'z{init_z_method}_md{int(multi_dim)}_s{seed}/'
-        f'{model_type}_p{pos_alpha}_n{neg_alpha}'
-    )
-
-    abs_path = os.path.abspath(relative_path)
-    if os.name == 'nt' and len(abs_path) > 200:
-        if not abs_path.startswith('\\\\?\\'):
-            abs_path = '\\\\?\\' + abs_path
-
-    os.makedirs(abs_path, exist_ok=True)
-
-    return run_domain_adaptation(
-        pos_alpha, neg_alpha, model_type, seed, abs_path,
-        estimate_prob_type, init_z_method, multi_dim,
-        classifiers, source_domains, delta_multiplier, fixed_epsilon_dict
-    )
-
-
-def run_domain_adaptation(alpha_pos, alpha_neg, vr_model_type, seed, test_path, estimate_prob_type, init_z_method,
-                          multi_dim, classifiers, source_domains, delta_multiplier, fixed_epsilon_dict):
-    torch.manual_seed(seed)
-    np.random.seed(seed=seed)
-    logging_filename = "domain_adaptation.log"
-    logging.basicConfig(filename=logging_filename, level=logging.DEBUG)
-
-    target_domains_sets = [
-        ['MNIST', 'USPS', 'SVHN'],
-        ['MNIST', 'USPS'], ['MNIST', 'SVHN'], ['USPS', 'SVHN']
-        # ,
-        # ['MNIST'], ['USPS'], ['SVHN']
-    ]
-    unique_targets = ['MNIST', 'USPS', 'SVHN']
-
-    models = {}
-    normalize_factors = {'MNIST': (0, 0), 'USPS': (0, 0), 'SVHN': (0, 0)}
-    print(f"\n>>>> [INIT] ({vr_model_type} {alpha_pos}, {alpha_neg}) <<<<")
-
-    for domain in source_domains:
-        model = vr_model(alpha_pos, alpha_neg).to(device)
-        filename = f"{vr_model_type}_{alpha_pos}_{alpha_neg}_{domain}_seed1_model.pt"
-        pattern = f"./models_{domain}_seed1*/{filename}"
-        matches = glob.glob(pattern)
-        if not matches: continue
-        model.load_state_dict(torch.load(max(matches, key=os.path.getmtime), map_location=torch.device(device)))
-        models[domain] = model
-
-        if estimate_prob_type in ["OURS-STD-SCORE", "OURS-STD-SCORE-WITH-KDE"]:
-            train_loader, test_loader = Data.get_data_loaders(domain, seed=seed)
-            domain_probs = torch.tensor([]).to(device)
-            for data, _ in train_loader:
-                with torch.no_grad():
-                    data = data.to(device)
-                    x_hat, mu, logstd = models[domain](data)
-                    log_p = models[domain].compute_log_probabitility_gaussian(x_hat, data.view(data.shape[0], -1),
-                                                                              torch.zeros_like(x_hat))
-                    domain_probs = torch.cat((log_p, domain_probs), 0)
-            normalize_factors[domain] = (domain_probs.mean().item(), domain_probs.std().item())
-
-    # 1. Train Matrices
-    print(f"  > Preparing Data Matrices...")
-    data_size = 0
-    data_loaders = []
-    for k, domain in enumerate(source_domains):
-        train_loader, _ = Data.get_data_loaders(domain, seed=seed, num_datapoints=1000)
-        data_size += len(train_loader.dataset)
-        data_loaders.append((domain, train_loader))
-
-    if multi_dim:
-        Y_opt, D_opt, H_opt = build_DP_model_Classes(data_loaders, data_size, source_domains, models, classifiers,
-                                                     test_path, normalize_factors, estimate_prob_type)
-    else:
-        Y_opt, D_opt, H_opt = build_DP_model(data_loaders, data_size, source_domains, models, classifiers, test_path,
-                                             normalize_factors, estimate_prob_type)
-
-    # 2. Test Cache
-    print(f"  > Pre-computing Test Matrices...")
-    test_cache = {}
-    for domain in unique_targets:
-        _, test_loader = Data.get_data_loaders(domain, seed=seed)
-        d_size = len(test_loader.dataset)
-        d_loaders = [(domain, test_loader)]
-        if multi_dim:
-            Y_t, D_t, H_t = build_DP_model_Classes(d_loaders, d_size, source_domains, models, classifiers, test_path,
-                                                   normalize_factors, estimate_prob_type)
-        else:
-            Y_t, D_t, H_t = build_DP_model(d_loaders, d_size, source_domains, models, classifiers, test_path,
-                                           normalize_factors, estimate_prob_type)
-        test_cache[domain] = (Y_t, D_t, H_t)
-
-    # 3. Solvers Loop
-    solvers_to_run = ["DC", "CVXPY", "CVXPY_PER_DOMAIN"]
-    results_for_this_config = []
-    weights_col_name = f"Weights ({', '.join(source_domains)})"
-
-    for solver_name in solvers_to_run:
-        # Run optimization with FIXED epsilons and Auto-Relaxation for Delta
-        learned_z, final_eps, final_delta = run_single_optimization(
-            solver_name, Y_opt, D_opt, H_opt, source_domains, seed, init_z_method,
-            test_path, delta_multiplier, fixed_epsilon_dict
-        )
-
-        print(f"   > Final Z ({solver_name}): {learned_z}")
-
-        z_str = "[" + ", ".join([f"{z:.3f}" for z in learned_z]) + "]"
-
-        # Shorter filename
-        z_filename = f'Res_{solver_name}_D{final_delta:.2f}.txt'
-
-        with open(os.path.join(test_path, z_filename), 'w') as fp:
-            fp.write(f'# Solver: {solver_name}\n')
-            fp.write(f'# Fixed Epsilon (from CSV, not Multiplier)\n')
-            fp.write(f'# Final Delta Multiplier: {final_delta}\n')
-            fp.write(f'\nz_MNIST = {learned_z[0]}\tz_USPS = {learned_z[1]}\tz_SVHN = {learned_z[2]}\n')
-
-            model_name_str = f"{vr_model_type.upper()}_{alpha_pos}_{alpha_neg}_{solver_name}"
-
-            domain_stats = {}
-            for domain in unique_targets:
-                Y_c, D_c, H_c = test_cache[domain]
-                correct, total = evaluate_z_on_data(Y_c, D_c, H_c, learned_z, multi_dim, source_domains)
-                domain_stats[domain] = (correct, total)
-
-            for target_domains in target_domains_sets:
-                total_correct = 0
-                total_samples = 0
-                for d in target_domains:
-                    c, t = domain_stats[d]
-                    total_correct += c
-                    total_samples += t
-                score = total_correct / total_samples if total_samples > 0 else 0
-
-                short_names = []
-                if 'MNIST' in target_domains: short_names.append('m')
-                if 'SVHN' in target_domains: short_names.append('s')
-                if 'USPS' in target_domains: short_names.append('u')
-                col_key = "".join(sorted(short_names))
-
-                results_for_this_config.append({
-                    "Model": model_name_str,
-                    "Target": col_key,
-                    "Score": score * 100,
-                    weights_col_name: z_str,
-                    "Final Eps Mult": "Fixed",
-                    "Final Delta Mult": f"{final_delta:.2f}",
-                    "Solver": solver_name
-                })
-                fp.write(f"{target_domains}\t{score * 100}\n")
-
-    return results_for_this_config
-
-
-def load_fixed_epsilons(csv_path):
-    """
-    Loads the cross-domain accuracy CSV and extracts the self-error (1 - acc/100)
-    for each domain.
-    """
-    try:
-        # Assuming format: Source, Target, Accuracy
-        df = pd.read_csv(csv_path, header=None, names=['Source', 'Target', 'Accuracy'])
-
-        # Filter for rows where Source == Target (Diagonal)
-        self_performance = df[df['Source'] == df['Target']]
-
-        epsilon_dict = {}
-        for _, row in self_performance.iterrows():
-            domain = row['Source']
-            acc = row['Accuracy']
-            error = 1.0 - (acc / 100.0)  # Convert Accuracy % to Error rate (0-1)
-            epsilon_dict[domain] = error
-
-        print("Loaded Fixed Epsilons (Error Rates):", epsilon_dict)
-        return epsilon_dict
-    except Exception as e:
-        print(f"Error loading epsilon CSV: {e}")
-        return {}
+    return ModelWrap(m).to(device).eval()
 
 
 def main():
-    print("device = ", device)
+    timestamp = time.strftime("%Y%m%d-%H%M")
+    output_dir = os.path.join("./Results", f"RESEARCH_RUN_{timestamp}");
+    os.makedirs(output_dir, exist_ok=True)
+    all_domains = ['Art', 'Clipart', 'Product', 'Real World']
 
-    # --- CONFIGURATION ---
-    DELTA_MULTIPLIER = 1.05
+    print(f"\n🚀 STARTING EXPERIMENT: {timestamp}")
+    classifiers = {d: load_full_classifier(d) for d in all_domains}
 
-    # Load fixed epsilons from CSV
-    csv_path = 'source_models_cross_domain_accuracy.csv'
-    fixed_epsilon_dict = load_fixed_epsilons(csv_path)
+    for r in range(FLAGS["MIN_TARGET_GROUP_SIZE"], FLAGS["MAX_TARGET_GROUP_SIZE"] + 1):
+        for target_comb in itertools.combinations(all_domains, r):
+            target_comb = list(target_comb)
+            source_list = all_domains if FLAGS["INCLUDE_TARGET_IN_SOURCES"] else [d for d in all_domains if d not in target_comb]
+            ratios = get_clear_imbalanced_ratios(len(target_comb))
 
-    if not fixed_epsilon_dict:
-        print("CRITICAL WARNING: Could not load fixed epsilons. Using defaults or crashing.")
-        # Fallback manual values if CSV fails (optional safety net)
-        fixed_epsilon_dict = {'MNIST': 0.0051, 'USPS': 0.0309, 'SVHN': 0.0566}
+            print(f"\n{'=' * 65}\n[RUN] Target Mixture: {target_comb} | Ratios: {np.round(ratios, 2)}")
+            target_info = []
+            for i, dom in enumerate(target_comb):
+                _, test_loader, _ = Data.get_data_loaders(dom, seed=1)
+                n_sample = min(int(FLAGS['TARGET_SAMPLE_SIZE'] * ratios[i]), len(test_loader.dataset))
+                indices = np.random.choice(np.arange(len(test_loader.dataset)), n_sample, replace=False)
+                target_info.append((dom, DataLoader(Subset(test_loader.dataset, indices), batch_size=32), indices))
+                print(f"      -> {dom:10}: {n_sample} samples")
 
-    classifiers = {}
-    source_domains = ['MNIST', 'USPS', 'SVHN']
-    for domain in source_domains:
-        classifier = ClSFR.Grey_32_64_128_gp().to(device)
-        try:
-            classifier.load_state_dict(
-                torch.load(f"./classifiers_new/{domain}_classifier.pt", map_location=torch.device(device)))
-            classifiers[domain] = classifier
-        except FileNotFoundError:
-            pass
+            # חישוב מטריצות בזמן אמת כולל דיבוג עמוק
+            Y, D, H = build_DP_matrices(target_info, source_list, classifiers)
 
-    # Note: Keep the folder name reasonable length if possible
-    estimate_prob_types = ["OURS-STD-SCORE-WITH-KDE"]
-    init_z_methods = ["err"]
-    multi_dim_vals = [True]
-    date = '15_12'
-    seeds = [10]
-    alphas_by_model = {
-        "vrs": [(2, -2), (2, -0.5), (0.5, -2), (0.5, -0.5)],
-        "vr": [(2, -1), (0.5, -1)],
-        "vae": [(1, -1)],
-    }
+            # Baseline - Uniform
+            uni_w = np.ones(len(source_list)) / len(source_list)
+            uni_pred = ((D * H) * uni_w.reshape(1, 1, -1)).sum(2).argmax(1)
+            uni_acc = accuracy_score(Y.argmax(1), uni_pred) * 100
+            print(f"   [BASELINE] Uniform Accuracy: {uni_acc:.2f}%")
 
-    tasks = []
-    for seed in seeds:
-        for estimate_prob_type in estimate_prob_types:
-            for init_z_method in init_z_methods:
-                for multi_dim in multi_dim_vals:
-                    for model_type, pairs in alphas_by_model.items():
-                        for (pos_alpha, neg_alpha) in pairs:
-                            tasks.append(
-                                (date, seed, estimate_prob_type, init_z_method, multi_dim, model_type, pos_alpha,
-                                 neg_alpha))
+            # יצירת גריד האפסילונים
+            eps_grid = [
+                np.linspace(ERROR_MATRIX[s][s], max([ERROR_MATRIX[t][s] for t in all_domains]), FLAGS["N_SWEEP_STEPS"])
+                for s in source_list]
+            eps_grid = np.array(eps_grid).T
 
-    print("\n🚀 Starting Parallel Execution (n_jobs=-1)...")
-    results_lists = Parallel(n_jobs=-1, verbose=10)(
-        delayed(task_run)(*t, classifiers, source_domains, DELTA_MULTIPLIER, fixed_epsilon_dict) for t in tasks
-    )
-
-    flat_results = [item for sublist in results_lists for item in sublist]
-    df = pd.DataFrame(flat_results)
-
-    if not df.empty:
-        weights_col = f"Weights ({', '.join(source_domains)})"
-
-        final_table = df.pivot_table(
-            index=['Model', 'Solver', weights_col, 'Final Eps Mult', 'Final Delta Mult'],
-            columns='Target',
-            values='Score'
-        )
-        final_table['mean'] = final_table.mean(axis=1)
-        final_table = final_table.round(1)
-
-        base_name = f'final_summary_results_{date}_FixedEps_delta_{DELTA_MULTIPLIER}'
-        extension = '_COMPARISON.csv'
-        version = 1
-        while True:
-            output_csv_name = f'{base_name}_v{version}{extension}'
-            if not os.path.exists(output_csv_name): break
-            version += 1
-
-        final_table.to_csv(output_csv_name)
-        print(f"\n✅ Saved to: {output_csv_name}")
-        print(final_table)
-    else:
-        print("No results collected.")
+            res_filename = os.path.join(output_dir, f"Results_{'_'.join(target_comb)}.txt")
+            with open(res_filename, "w") as f:
+                f.write(f"Target Mixture: {target_comb}\nBASELINE UNIFORM ACC: {uni_acc:.2f}%\n" + "=" * 60 + "\n")
+                results = Parallel(n_jobs=FLAGS["N_JOBS"])(
+                    delayed(run_solver_at_epsilon)(Y, D, H, ev, source_list, all_domains) for ev in eps_grid
+                )
+                for res in results:
+                    if res: f.write(res)
+            print(f"   [DONE] Results: {res_filename}")
 
 
 if __name__ == "__main__":

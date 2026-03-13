@@ -14,6 +14,9 @@ OFFICE_HOME_DOMAINS = ['Art', 'Clipart', 'Product', 'Real World']
 OFFICE_31_PATH = './Office-31'
 OFFICE_31_DOMAINS = ['amazon', 'dslr', 'webcam']
 
+DOMAINNET_PATH = '/data/nogaz/Bi-ATEN/dataset/domainnet'
+DOMAINNET_DOMAINS = ['clipart', 'infograph', 'painting', 'quickdraw', 'real', 'sketch']
+
 DOMAIN_CONFIGS = {
     'Digits': {
         'size': 28,
@@ -26,6 +29,11 @@ DOMAIN_CONFIGS = {
         'flat_dim': 224 * 224 * 3
     },
     'Office31': {
+        'size': 224,
+        'channels': 3,
+        'flat_dim': 224 * 224 * 3
+    },
+    'DomainNet': {
         'size': 224,
         'channels': 3,
         'flat_dim': 224 * 224 * 3
@@ -98,6 +106,10 @@ def get_config(data_name):
         conf = DOMAIN_CONFIGS['OfficeHome'].copy()
         conf['flat_dim'] = conf['size'] * conf['size'] * conf['channels']
         return conf
+    elif data_name in DOMAINNET_DOMAINS:
+        conf = DOMAIN_CONFIGS['DomainNet'].copy()
+        conf['flat_dim'] = conf['size'] * conf['size'] * conf['channels']
+        return conf
     elif data_name in OFFICE_31_DOMAINS:
         conf = DOMAIN_CONFIGS['Office31'].copy()
         conf['flat_dim'] = conf['size'] * conf['size'] * conf['channels']
@@ -144,6 +156,10 @@ def get_office31_split(dataset, domain_name, seed=None):
 def get_dataset(data_name, trans):
     if data_name in OFFICE_HOME_DOMAINS:
         full_path = os.path.join(OFFICE_HOME_PATH, data_name)
+        dataset = datasets.ImageFolder(root=full_path, transform=trans)
+        return dataset, None
+    elif data_name in DOMAINNET_DOMAINS:
+        full_path = os.path.join(DOMAINNET_PATH, data_name)
         dataset = datasets.ImageFolder(root=full_path, transform=trans)
         return dataset, None
     elif data_name in OFFICE_31_DOMAINS:
@@ -196,7 +212,7 @@ def get_data_loaders(data_name, seed=None, num_datapoints=None, batch_size=128, 
     raw_train, raw_test = get_dataset(data_name, None)
 
     # Case A: Office Datasets (RGB with Augmentation)
-    if (data_name in OFFICE_HOME_DOMAINS) or (data_name in OFFICE_31_DOMAINS):
+    if (data_name in OFFICE_HOME_DOMAINS) or (data_name in OFFICE_31_DOMAINS) or (data_name in DOMAINNET_DOMAINS):
         dataset = raw_train
         if data_name in OFFICE_31_DOMAINS:
             train_subset, test_subset = get_office31_split(dataset, data_name, seed)

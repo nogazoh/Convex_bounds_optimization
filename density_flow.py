@@ -328,5 +328,92 @@ def run_experiment():
     print("✅ Done.")
 
 
+# ==========================================
+# 5. EXTERNAL API: UPDATE D MATRIX
+# ==========================================
+def compute_density_matrix_on_loader(data_loader, density_models, active_domains, device, temperature=8.0,
+                                     latent_dim=64):
+    """
+    Calculates the Density Matrix D for a given loader of new samples (e.g., Transformed Features).
+
+    Args:
+        data_loader: DataLoader yielding batches of data.
+                     NOTE: Data dimensions must match the Autoencoder input!
+                     (If using ResNet Features + Adapter, use LinearAutoencoder and pass vectors of size 2048).
+        density_models: Dict containing {'ae', 'fm', 'stats'} for each domain.
+        active_domains: List of domain names to evaluate against.
+        device: torch device.
+        temperature: Scaling factor for Likelihoods.
+        latent_dim: Latent dimension for Flow Matching.
+
+    Returns:
+        D_matrix: Numpy array of shape (N_samples, N_domains).
+    """
+    N = len(data_loader.dataset)
+    K = len(active_domains)
+    Raw_LogP = []
+
+    print(f"   [DensityFlow] Computing Matrix D for {N} samples against {active_domains}...")
+
+    # We compute column by column (per domain model) to save memory/graph switching
+    domain_scores = {d: [] for d in active_domains}
+
+    with torch.no_grad():
+        for dom in active_domains:
+            if dom not in density_models:
+                print(f"⚠️ Warning: No density model found for {dom}. Skipping.")
+                continue
+
+            # Unpack models
+            ae = density_models[dom]['ae']
+            fm = density_models[dom]['fm']
+            mu, std = density_models[dom]['stats']
+
+            # Ensure evaluation mode
+            ae.eval()
+            fm.eval()
+
+            # Iterate over new samples
+            for x_batch, _ in data_loader:  # Assuming loader returns (data, label)
+                x_batch = x_batch.to(device)
+
+                # 1. Encode & Normalize
+                # (Note: x_batch must match AE input. If features: 2048. If images: 3x64x64)
+                _, z = ae(x_batch)
+                z_norm = (z - mu) / std
+
+                # 2. Compute Likelihood
+                # We reuse the existing compute_ll function
+                ll = compute_ll(fm, z_norm, latent_dim)
+                domain_scores[dom].append(ll.cpu().numpy())
+
+    # Stack results into Matrix (N, K)
+    # Ensure consistent ordering based on active_domains
+    cols = []
+    for dom in active_domains:
+        if len(domain_scores[dom]) > 0:
+            cols.append(np.concatenate(domain_scores[dom]).flatten())
+        else:
+            cols.append(np.zeros(N))  # Fallback
+
+    Raw_LogP = np.stack(cols, axis=1).astype(np.float64)
+
+    # 3. Scale and Normalize (Softmax-like with Temperature)
+    print(f"   [DensityFlow] Applying Scaling T={temperature}...")
+
+    global_max = np.max(Raw_LogP)
+    # Avoid overflow/underflow by shifting
+    scaled_log_p = (Raw_LogP - global_max) / temperature
+
+    # Clip very low values to prevent numerical issues
+    min_clip = -100.0
+    scaled_log_p = np.maximum(scaled_log_p, min_clip)
+
+    D = np.exp(scaled_log_p)
+    if np.max(D) > 0:
+        D = D / np.max(D)
+
+    return D
+
 if __name__ == "__main__":
     run_experiment()

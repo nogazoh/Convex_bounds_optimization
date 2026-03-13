@@ -52,7 +52,7 @@ torch.set_num_threads(1)
 # ==========================================
 # --- CONFIGURATION ---
 # ==========================================
-DATASET_MODE = "DIGITS"# "DIGITS" #"OFFICE224"V #"OFFICE31" V
+DATASET_MODE = "DOMAINNET"# "DIGITS"VX #"OFFICE224"VX #"OFFICE31"V
 USE_PRECOMPUTED_D = True
 USE_ARTIFICIAL_RATIOS = True
 
@@ -87,6 +87,14 @@ CONFIGS = {
         "SOURCE_ERRORS": {'amazon': 0.1352, 'dslr': 0.0178, 'webcam': 0.0225},
         "TEST_SET_SIZES": {'amazon': 563, 'dslr': 100, 'webcam': 159},
         "D_PRECOMP_PATH":"/data/nogaz/Convex_bounds_optimization/LatentFlow_Pixel_Experiments/results/D_Matrix_FINAL_GMM_Soft.npy"
+    },
+    "DOMAINNET": {
+        "DOMAINS": ["clipart", "infograph", "painting", "quickdraw", "real", "sketch"],
+        "CLASSES": 345,
+        "INPUT_DIM": 2048,
+        "SOURCE_ERRORS": {'clipart': 0.0637, 'infograph': 0.1523, 'painting': 0.0656, 'quickdraw': 0.1512, 'real': 0.0382, 'sketch': 0.0796},
+        "TEST_SET_SIZES": {'clipart': 9767, 'infograph': 10641, 'painting': 15152, 'quickdraw': 34500, 'real': 35066, 'sketch': 14078},
+        "D_PRECOMP_PATH": "/data/nogaz/Convex_bounds_optimization/LatentFlow_Pixel_Experiments/results/D_Matrix_Optimized_DomainNet.npy"
     }
 }
 
@@ -114,7 +122,103 @@ TARGET_RATIOS_CONFIG = {
     ('Art', 'Clipart', 'Real World'): {'Art': 0.15, 'Clipart': 0.70, 'Real World': 0.15},
     ('Art', 'Product', 'Real World'): {'Art': 0.60, 'Product': 0.20, 'Real World': 0.20},
     ('Clipart', 'Product', 'Real World'): {'Clipart': 0.10, 'Product': 0.30, 'Real World': 0.60},
-    ('Art', 'Clipart', 'Product', 'Real World'): {'Art': 0.40, 'Clipart': 0.10, 'Product': 0.10, 'Real World': 0.40}
+    ('Art', 'Clipart', 'Product', 'Real World'): {'Art': 0.40, 'Clipart': 0.10, 'Product': 0.10, 'Real World': 0.40},
+
+    # =========================================================================
+    # --- DOMAINNET (Pre-calculated Dirichlet random distribution, Seed=42) ---
+    # =========================================================================
+
+    # Pairs (2 domains)
+    ('clipart', 'infograph'): {'clipart': 0.3745, 'infograph': 0.6255},
+    ('clipart', 'painting'): {'clipart': 0.7320, 'painting': 0.2680},
+    ('clipart', 'quickdraw'): {'clipart': 0.1560, 'quickdraw': 0.8440},
+    ('clipart', 'real'): {'clipart': 0.0581, 'real': 0.9419},
+    ('clipart', 'sketch'): {'clipart': 0.8662, 'sketch': 0.1338},
+    ('infograph', 'painting'): {'infograph': 0.0206, 'painting': 0.9794},
+    ('infograph', 'quickdraw'): {'infograph': 0.8324, 'quickdraw': 0.1676},
+    ('infograph', 'real'): {'infograph': 0.2123, 'real': 0.7877},
+    ('infograph', 'sketch'): {'infograph': 0.1818, 'sketch': 0.8182},
+    ('painting', 'quickdraw'): {'painting': 0.1834, 'quickdraw': 0.8166},
+    ('painting', 'real'): {'painting': 0.3042, 'real': 0.6958},
+    ('painting', 'sketch'): {'painting': 0.5247, 'sketch': 0.4753},
+    ('quickdraw', 'real'): {'quickdraw': 0.4320, 'real': 0.5680},
+    ('quickdraw', 'sketch'): {'quickdraw': 0.2912, 'sketch': 0.7088},
+    ('real', 'sketch'): {'real': 0.6119, 'sketch': 0.3881},
+
+    # Triplets (3 domains)
+    ('clipart', 'infograph', 'painting'): {'clipart': 0.0772, 'infograph': 0.8039, 'painting': 0.1189},
+    ('clipart', 'infograph', 'quickdraw'): {'clipart': 0.5488, 'infograph': 0.2809, 'quickdraw': 0.1703},
+    ('clipart', 'infograph', 'real'): {'clipart': 0.2140, 'infograph': 0.5300, 'real': 0.2560},
+    ('clipart', 'infograph', 'sketch'): {'clipart': 0.1441, 'infograph': 0.6559, 'sketch': 0.2000},
+    ('clipart', 'painting', 'quickdraw'): {'clipart': 0.2010, 'painting': 0.3340, 'quickdraw': 0.4650},
+    ('clipart', 'painting', 'real'): {'clipart': 0.1111, 'painting': 0.1111, 'real': 0.7778},
+    ('clipart', 'painting', 'sketch'): {'clipart': 0.4000, 'painting': 0.3000, 'sketch': 0.3000},
+    ('clipart', 'quickdraw', 'real'): {'clipart': 0.2500, 'quickdraw': 0.6000, 'real': 0.1500},
+    ('clipart', 'quickdraw', 'sketch'): {'clipart': 0.3500, 'quickdraw': 0.4500, 'sketch': 0.2000},
+    ('clipart', 'real', 'sketch'): {'clipart': 0.1000, 'real': 0.8000, 'sketch': 0.1000},
+    ('infograph', 'painting', 'quickdraw'): {'infograph': 0.0500, 'painting': 0.0500, 'quickdraw': 0.9000},
+    ('infograph', 'painting', 'real'): {'infograph': 0.7000, 'painting': 0.2000, 'real': 0.1000},
+    ('infograph', 'painting', 'sketch'): {'infograph': 0.3334, 'painting': 0.3333, 'sketch': 0.3333},
+    ('infograph', 'quickdraw', 'real'): {'infograph': 0.8000, 'quickdraw': 0.1500, 'real': 0.0500},
+    ('infograph', 'quickdraw', 'sketch'): {'infograph': 0.2000, 'quickdraw': 0.2000, 'sketch': 0.6000},
+    ('infograph', 'real', 'sketch'): {'infograph': 0.1500, 'real': 0.7500, 'sketch': 0.1000},
+    ('painting', 'quickdraw', 'real'): {'painting': 0.4000, 'quickdraw': 0.1000, 'real': 0.5000},
+    ('painting', 'quickdraw', 'sketch'): {'painting': 0.5000, 'quickdraw': 0.2500, 'sketch': 0.2500},
+    ('painting', 'real', 'sketch'): {'painting': 0.1000, 'real': 0.6000, 'sketch': 0.3000},
+    ('quickdraw', 'real', 'sketch'): {'quickdraw': 0.6000, 'real': 0.2000, 'sketch': 0.2000},
+
+    # Quadruplets (4 domains)
+    ('clipart', 'infograph', 'painting', 'quickdraw'): {'clipart': 0.0573, 'infograph': 0.0478, 'painting': 0.6738,
+                                                        'quickdraw': 0.2211},
+    ('clipart', 'infograph', 'painting', 'real'): {'clipart': 0.1000, 'infograph': 0.2000, 'painting': 0.5000,
+                                                   'real': 0.2000},
+    ('clipart', 'infograph', 'painting', 'sketch'): {'clipart': 0.4000, 'infograph': 0.1000, 'painting': 0.3000,
+                                                     'sketch': 0.2000},
+    ('clipart', 'infograph', 'quickdraw', 'real'): {'clipart': 0.1500, 'infograph': 0.4500, 'quickdraw': 0.1500,
+                                                    'real': 0.2500},
+    ('clipart', 'infograph', 'quickdraw', 'sketch'): {'clipart': 0.3000, 'infograph': 0.3000, 'quickdraw': 0.3000,
+                                                      'sketch': 0.1000},
+    ('clipart', 'infograph', 'real', 'sketch'): {'clipart': 0.2000, 'infograph': 0.2000, 'real': 0.4000,
+                                                 'sketch': 0.2000},
+    ('clipart', 'painting', 'quickdraw', 'real'): {'clipart': 0.0500, 'painting': 0.8500, 'quickdraw': 0.0500,
+                                                   'real': 0.0500},
+    ('clipart', 'painting', 'quickdraw', 'sketch'): {'clipart': 0.1250, 'painting': 0.1250, 'quickdraw': 0.5000,
+                                                     'sketch': 0.2500},
+    ('clipart', 'painting', 'real', 'sketch'): {'clipart': 0.2500, 'painting': 0.2500, 'real': 0.2500,
+                                                'sketch': 0.2500},
+    ('clipart', 'quickdraw', 'real', 'sketch'): {'clipart': 0.6000, 'quickdraw': 0.1000, 'real': 0.1000,
+                                                 'sketch': 0.2000},
+    ('infograph', 'painting', 'quickdraw', 'real'): {'infograph': 0.1000, 'painting': 0.1000, 'quickdraw': 0.1000,
+                                                     'real': 0.7000},
+    ('infograph', 'painting', 'quickdraw', 'sketch'): {'infograph': 0.1500, 'painting': 0.3500, 'quickdraw': 0.3500,
+                                                       'sketch': 0.1500},
+    ('infograph', 'painting', 'real', 'sketch'): {'infograph': 0.4000, 'painting': 0.1000, 'real': 0.1000,
+                                                  'sketch': 0.4000},
+    ('infograph', 'quickdraw', 'real', 'sketch'): {'infograph': 0.3000, 'quickdraw': 0.4000, 'real': 0.2000,
+                                                   'sketch': 0.1000},
+    ('painting', 'quickdraw', 'real', 'sketch'): {'painting': 0.2000, 'quickdraw': 0.2000, 'real': 0.3000,
+                                                  'sketch': 0.3000},
+
+    # Quintuplets (5 domains)
+    ('clipart', 'infograph', 'painting', 'quickdraw', 'real'): {'clipart': 0.0768, 'infograph': 0.1340,
+                                                                'painting': 0.0764, 'quickdraw': 0.3346,
+                                                                'real': 0.3782},
+    ('clipart', 'infograph', 'painting', 'quickdraw', 'sketch'): {'clipart': 0.1500, 'infograph': 0.2500,
+                                                                  'painting': 0.1000, 'quickdraw': 0.1500,
+                                                                  'sketch': 0.3500},
+    ('clipart', 'infograph', 'painting', 'real', 'sketch'): {'clipart': 0.1000, 'infograph': 0.4000, 'painting': 0.2000,
+                                                             'real': 0.1000, 'sketch': 0.2000},
+    ('clipart', 'infograph', 'quickdraw', 'real', 'sketch'): {'clipart': 0.3000, 'infograph': 0.1500,
+                                                              'quickdraw': 0.2000, 'real': 0.2000, 'sketch': 0.1500},
+    ('clipart', 'painting', 'quickdraw', 'real', 'sketch'): {'clipart': 0.2500, 'painting': 0.1000, 'quickdraw': 0.1000,
+                                                             'real': 0.2500, 'sketch': 0.3000},
+    ('infograph', 'painting', 'quickdraw', 'real', 'sketch'): {'infograph': 0.0500, 'painting': 0.4500,
+                                                               'quickdraw': 0.2000, 'real': 0.1500, 'sketch': 0.1500},
+
+    # Sextuplets (All 6 domains)
+    ('clipart', 'infograph', 'painting', 'quickdraw', 'real', 'sketch'): {'clipart': 0.1023, 'infograph': 0.1528,
+                                                                          'painting': 0.0805, 'quickdraw': 0.3688,
+                                                                          'real': 0.1292, 'sketch': 0.1664}
 }
 
 CURRENT_CFG = CONFIGS[DATASET_MODE]
@@ -196,6 +300,9 @@ def get_domain_path(domain_name: str) -> str:
         p1 = os.path.join(OFFICE31_DIR, domain_name, "images")
         p2 = os.path.join(OFFICE31_DIR, domain_name)
         return p1 if os.path.exists(p1) else p2
+    elif DATASET_MODE == "DOMAINNET":
+        DOMAINNET_DIR = "/data/nogaz/Bi-ATEN/dataset/domainnet"
+        return os.path.join(DOMAINNET_DIR, domain_name)
     else:
         raise ValueError("Precomputed D slicing is implemented for OFFICE/OFFICE224/OFFICE31 only.")
 
@@ -577,112 +684,32 @@ def build_YDH_with_precomputed_D(target_domains, seed, classifiers,
 def apply_custom_ratios(Y, D, H, target_domains, custom_ratios_dict):
     current_sizes = [TEST_SET_SIZES[d] for d in target_domains]
     requested_ratios = [custom_ratios_dict[d] for d in target_domains]
+
     max_total_N = int(min([actual / ratio for actual, ratio in zip(current_sizes, requested_ratios)]))
+    # הוספת התקרה כדי למנוע קריסת RAM - היחסים נשמרים!
+    max_total_N = min(max_total_N, 15000)
     new_indices = []
     offset = 0
     for i, dom in enumerate(target_domains):
         n_to_take = int(max_total_N * requested_ratios[i])
         new_indices.extend(range(offset, offset + n_to_take))
         offset += current_sizes[i]
-    print(f" [Subsample] Adjusting matrices: Original N={sum(current_sizes)} -> New N={len(new_indices)}")
+
+    print(f" [Subsample] Adjusting: New N={len(new_indices)} | Ratios: {requested_ratios}")
     return Y[new_indices], D[new_indices], H[new_indices]
-
-
-# def task_run(classifiers, all_source_domains):
-#     seed = 1
-#     torch.manual_seed(seed)
-#     np.random.seed(seed)
-#     test_path = f'./results_{DATASET_MODE}_recreate/seed_{seed}/'
-#     os.makedirs(test_path, exist_ok=True)
-#
-#     if USE_PRECOMPUTED_D is False:
-#         models, normalize_factors, vae_norm_stats = handle_vae_models(all_source_domains, classifiers, seed)
-#
-#     # --- Precomputed D initialization (optional) ---
-#     Global_D = None
-#     domain_lengths = None
-#     if USE_PRECOMPUTED_D and os.path.exists(D_PRECOMP_PATH):
-#         Global_D = load_global_D_matrix(D_PRECOMP_PATH)
-#         if Global_D is not None:
-#             domain_lengths = compute_domain_lengths(all_source_domains)
-#
-#     print("\n--- Starting Target Combinations ---")
-#     with open(os.path.join(test_path, f'Sweep_Results_{seed}_PRE_D_{USE_PRECOMPUTED_D}_art_ratios{USE_ARTIFICIAL_RATIOS}.txt'), 'a') as fp:
-#         for target in [list(s) for r in range(2, len(all_source_domains) + 1) for s in
-#                        itertools.combinations(all_source_domains, r)]:
-#             # if set(target) in ({'MNIST', 'USPS'}): #, {'MNIST', 'SVHN'}):
-#             #     print("skip " + str(set(target)))
-#             #     continue
-#
-#             print(f"\n[TARGET] Starting run for: {target}")
-#             total_s = sum([TEST_SET_SIZES.get(d, 0) for d in target])
-#             true_r = map_weights_to_full_source_list(
-#                 np.array([TEST_SET_SIZES.get(d, 0) / total_s if total_s > 0 else 0 for d in target]),
-#                 target,
-#                 all_source_domains
-#             )
-#
-#             fp.write(f"\n{'=' * 120}\nTARGET: {target} | TRUE RATIOS: {np.round(true_r, 4)}\n{'=' * 120}\n")
-#             fp.write(
-#                 f"{'Solver':<18} | {'Epsilon Mult':<15} | {'Delta Mult':<15} | {'Acc (%)':<12} | {'Learned Weights'}\n" +
-#                 "-" * 120 + "\n"
-#             )
-#
-#             # ---------------------------------------------------------
-#             # CASE A: Use precomputed D (no KDE) - "like them"
-#             # ---------------------------------------------------------
-#             if Global_D is not None and domain_lengths is not None:
-#                 print("✅ Using PRECOMPUTED Global D (sliced) instead of KDE.")
-#                 Y, D, H = build_YDH_with_precomputed_D(
-#                     target_domains=target,
-#                     seed=seed,
-#                     classifiers=classifiers,
-#                     Global_D=Global_D,
-#                     domain_lengths=domain_lengths
-#                 )
-#
-#             # ---------------------------------------------------------
-#             # CASE B: Fallback: KDE (your existing pipeline)
-#             # ---------------------------------------------------------
-#             else:
-#                 el = []
-#                 for d in target:
-#                     _, l, _ = Data.get_data_loaders(d, seed=seed)
-#                     el.append((d, l))
-#                 Y, D, H = build_DP_model_Classes(
-#                     el,
-#                     sum(len(l.dataset) for _, l in el),
-#                     target,
-#                     models,
-#                     classifiers,
-#                     normalize_factors,
-#                     vae_norm_stats
-#                 )
-#             fp.write(run_baselines(Y, D, H, target, target, all_source_domains, seed))
-#             print(f" [Solver] Launching parallel workers for {target}...")
-#             results = Parallel(n_jobs=2, verbose=10)(
-#                 delayed(run_solver_sweep_worker)(Y, D, H, e, target, all_source_domains)
-#                 for e in [1.0, 1.1, 2]
-#             )
-#             for r in results:
-#                 fp.write(r)
-#             fp.flush()
-#             print(f"✅ Finished target: {target}")
-
 
 def task_run(classifiers, all_source_domains):
     seed = 1
     torch.manual_seed(seed)
     np.random.seed(seed)
+    import gc
 
-    # Updated path to reflect the ratio mode in the filename
     test_path = f'./results_{DATASET_MODE}_mosek/seed_{seed}/'
     os.makedirs(test_path, exist_ok=True)
 
     if USE_PRECOMPUTED_D is False:
         models, normalize_factors, vae_norm_stats = handle_vae_models(all_source_domains, classifiers, seed)
 
-    # --- Precomputed D initialization ---
     Global_D = None
     domain_lengths = None
     if USE_PRECOMPUTED_D and os.path.exists(D_PRECOMP_PATH):
@@ -690,89 +717,80 @@ def task_run(classifiers, all_source_domains):
         if Global_D is not None:
             domain_lengths = compute_domain_lengths(all_source_domains)
 
-    print("\n--- Starting Target Combinations ---")
-    filename = f'Sweep_Results_{seed}_PRE_D_{USE_PRECOMPUTED_D}_art_ratios_{USE_ARTIFICIAL_RATIOS}.txt'
+    filename = f'Sweep_Results_{seed}_3_sets_with_config.txt'
 
     with open(os.path.join(test_path, filename), 'a') as fp:
         for target in [list(s) for r in range(2, len(all_source_domains) + 1) for s in
                        itertools.combinations(all_source_domains, r)]:
 
-            # Use sorted tuple to match the TARGET_RATIOS_CONFIG keys reliably
             target_tuple = tuple(sorted(target))
 
-            print(f"\n[TARGET] Starting run for: {target}")
+            if target_tuple not in TARGET_RATIOS_CONFIG:
+                print(f"⚠️ Skipping {target} - not in TARGET_RATIOS_CONFIG")
+                continue
 
-            # ---------------------------------------------------------
-            # 1. Build Initial Matrices (Full Size)
-            # ---------------------------------------------------------
+            print(f"\n[TARGET] Processing: {target}")
+
+            set1 = TARGET_RATIOS_CONFIG[target_tuple]
+
+            keys = list(set1.keys())
+            vals = np.array([set1[k] for k in keys])
+            inv_vals = (1.0 / (vals + 1e-6))
+            inv_vals /= inv_vals.sum()
+            set2 = {keys[i]: inv_vals[i] for i in range(len(keys))}
+
+            set3 = {d: 1.0 / len(target) for d in target}
+
+            weight_sets = [
+                ("CONFIG_ORIGINAL", set1),
+                ("CONFIG_INVERSE", set2),
+                ("UNIFORM", set3)
+            ]
+
             if Global_D is not None and domain_lengths is not None and USE_PRECOMPUTED_D:
-                print("✅ Using PRECOMPUTED Global D (sliced) instead of KDE.")
-                Y, D, H = build_YDH_with_precomputed_D(
-                    target_domains=target,
-                    seed=seed,
-                    classifiers=classifiers,
-                    Global_D=Global_D,
-                    domain_lengths=domain_lengths
+                Y_full, D_full, H_full = build_YDH_with_precomputed_D(
+                    target_domains=target, seed=seed, classifiers=classifiers,
+                    Global_D=Global_D, domain_lengths=domain_lengths
                 )
             else:
                 el = []
                 for d in target:
                     _, l, _ = Data.get_data_loaders(d, seed=seed)
                     el.append((d, l))
-                Y, D, H = build_DP_model_Classes(
-                    el,
-                    sum(len(l.dataset) for _, l in el),
-                    target,
-                    models,
-                    classifiers,
-                    normalize_factors,
-                    vae_norm_stats
-                )
+                Y_full, D_full, H_full = build_DP_model_Classes(el, sum(len(l.dataset) for _, l in el),
+                                                                target, models, classifiers,
+                                                                normalize_factors, vae_norm_stats)
 
-            # ---------------------------------------------------------
-            # 2. Apply Artificial Ratios (Subsampling Logic)
-            # ---------------------------------------------------------
-            if USE_ARTIFICIAL_RATIOS and target_tuple in TARGET_RATIOS_CONFIG:
-                custom_ratios = TARGET_RATIOS_CONFIG[target_tuple]
-                print(f" ⚠️ Flag USE_ARTIFICIAL_RATIOS is ON. Applying: {custom_ratios}")
+            torch.cuda.empty_cache()
+            gc.collect()
 
-                # Resample Y, D, H to match the requested imbalance
-                Y, D, H = apply_custom_ratios(Y, D, H, target, custom_ratios)
+            for strategy_name, custom_ratios in weight_sets:
+                print(f"  -> Strategy: {strategy_name} | {custom_ratios}")
 
-                # Set weights based on custom configuration
+                Y, D, H = apply_custom_ratios(Y_full, D_full, H_full, target, custom_ratios)
+
                 true_r_weights = np.array([custom_ratios[d] for d in target])
-            else:
-                print(" ✅ Using natural dataset ratios.")
-                # Calculate natural weights based on original test set sizes
-                total_s = sum([TEST_SET_SIZES.get(d, 0) for d in target])
-                true_r_weights = np.array([TEST_SET_SIZES.get(d, 0) / total_s if total_s > 0 else 0 for d in target])
+                true_r_full = map_weights_to_full_source_list(true_r_weights, target, all_source_domains)
 
-            # Map the active weights to the full domain list for consistent logging
-            true_r = map_weights_to_full_source_list(true_r_weights, target, all_source_domains)
+                fp.write(
+                    f"\n{'=' * 100}\nTARGET: {target} | STRATEGY: {strategy_name}\nRATIOS: {np.round(true_r_full, 4)}\n{'=' * 100}\n")
 
-            # ---------------------------------------------------------
-            # 3. Logging and Solver Execution
-            # ---------------------------------------------------------
-            fp.write(f"\n{'=' * 120}\nTARGET: {target} | TRUE RATIOS: {np.round(true_r, 4)}\n{'=' * 120}\n")
-            fp.write(
-                f"{'Solver':<18} | {'Epsilon Mult':<15} | {'Delta Mult':<15} | {'Acc (%)':<12} | {'Learned Weights'}\n" +
-                "-" * 120 + "\n"
-            )
+                fp.write(run_baselines(Y, D, H, target, target, all_source_domains, seed, true_r_weights))
 
-            # run_baselines will now see the modified (resampled) matrices
-            fp.write(run_baselines(Y, D, H, target, target, all_source_domains, seed, true_r_weights))
+                results = Parallel(n_jobs=1, verbose=5)(
+                    delayed(run_solver_sweep_worker)(Y, D, H, e, target, all_source_domains)
+                    for e in [1.0, 1.1, 2.0]
+                )
+                for r in results: fp.write(r)
+                fp.flush()
+                del Y, D, H
+                gc.collect()
 
-            print(f" [Solver] Launching parallel workers for {target}...")
-            results = Parallel(n_jobs=2, verbose=10)(
-                delayed(run_solver_sweep_worker)(Y, D, H, e, target, all_source_domains)
-                for e in [1.0, 1.1, 2]
-            )
+            del Y_full, D_full, H_full
+            torch.cuda.empty_cache()
+            gc.collect()
+            print(f"✅ Finished all 3 sets for: {target}")
 
-            for r in results:
-                fp.write(r)
-
-            fp.flush()
-            print(f"✅ Finished target: {target}")
 
 def handle_vae_models(all_source_domains, classifiers, seed):
     models, normalize_factors, vae_norm_stats = {}, {}, {}
@@ -814,27 +832,37 @@ def handle_vae_models(all_source_domains, classifiers, seed):
 def main():
     print(f"Starting Main Process | Dataset Mode: {DATASET_MODE}")
     classifiers = {}
+    n_gpus = torch.cuda.device_count()
+    if n_gpus > 1:
+        print(f"🚀 Detected {n_gpus} GPUs! Enabling DataParallel for feature extraction.")
     for d in ALL_DOMAINS_LIST:
+        # Check for both naming conventions in the consolidated ./classifiers folder
+        p1 = f"./classifiers/{d}_224.pt"
+        p2 = f"./classifiers/{d}_classifier.pt"
+        path = p1 if os.path.exists(p1) else p2
+
+        if not os.path.exists(path):
+            print(f"❌ Warning: Classifier for {d} not found in ./classifiers/")
+            continue
+
         if DATASET_MODE == 'DIGITS':
             m = ClSFR.Grey_32_64_128_gp()
-            path = f"./classifiers_new/{d}_classifier.pt"
-            if not os.path.exists(path):
-                path = f"./classifiers/{d}_classifier.pt"
             print(f"Loading DIGITS model ({d}) from: {path}")
             m.load_state_dict(torch.load(path, map_location=device))
+            if n_gpus > 1:
+                m = nn.DataParallel(m)
             m = m.to(device).eval()
             classifiers[d] = m
-        # --- OFFICE (ResNet50) ---
         else:
             m = models.resnet50(weights=None)
             m.fc = nn.Linear(m.fc.in_features, NUM_CLASSES)
-            path = f"./classifiers/{d}_224.pt"
-            if not os.path.exists(path):
-                path = f"./classifiers_new/{d}_classifier.pt"
-            print(f"Loading ResNet model ({d}) from: {path}")
             m.load_state_dict(torch.load(path, map_location=device))
-            classifiers[d] = FeatureExtractor(m).to(device).eval()
+            extractor = FeatureExtractor(m)
+            if n_gpus > 1:
+                extractor = nn.DataParallel(extractor)
+            classifiers[d] = extractor.to(device).eval()
         print(f"✅ Loaded Classifier: {d}")
+
     task_run(classifiers, ALL_DOMAINS_LIST)
 
 

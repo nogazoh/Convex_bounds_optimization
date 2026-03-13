@@ -671,7 +671,7 @@ def run_baselines_and_dc(Y, D, H, target_domains, oracle_w):
     if dc_accuracies:
         avg = f"{np.mean(dc_accuracies):.2f} +/- {np.std(dc_accuracies):.2f}"
         msg_dc = f"{'DC (5-Seeds)':<18} | {'N/A':<6} | {'N/A':<5} | {avg:<12} | {str(np.round(best_w, 4))}"
-        print(f" >>> {msg_dc}")  # הוספתי הדפסה גם ל-DC
+        print(f" >>> {msg_dc}")
         buf.write(msg_dc + "\n")
     else:
         print(f" >>> {'DC (5-Seeds)':<18} | FAILED")

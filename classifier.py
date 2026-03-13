@@ -91,6 +91,13 @@ def build_network(domain):
         model.fc = nn.Linear(num_ftrs, n_classes)
         return model
 
+    elif domain in ['clipart', 'infograph', 'painting', 'quickdraw', 'real', 'sketch']:
+        model = models.resnet50(weights='IMAGENET1K_V1')
+        n_classes = 345
+        num_ftrs = model.fc.in_features
+        model.fc = nn.Linear(num_ftrs, n_classes)
+        return model
+
     else:
         raise ValueError(f"Unknown domain for network factory: {domain}")
 
@@ -214,10 +221,9 @@ def run_classifier(domain):
 
 def parallel_wrapper(domain):
     print(f"--- Process starting for {domain} on PID {os.getpid()} ---")
-
-    # Checking for the _224 version
-    save_path = f"./classifiers_new/{domain}_classifier.pt"
-
+    p1 = f"./classifiers/{domain}_224.pt"
+    p2 = f"./classifiers/{domain}_classifier.pt"
+    save_path = p1 if os.path.exists(p1) else p2
     if os.path.exists(save_path):
         print(f"[{domain}] Found existing model at {save_path}. Evaluating...")
         try:
@@ -244,6 +250,7 @@ def evaluate_cross_domain(domains):
     print("--> Pre-loading test datasets...")
     test_loaders = {}
     for d in domains:
+        # הטעינה כאן עלולה לקחת זמן בגלל גודל הדאטאסט ב-DomainNet
         _, test_loader, _ = Data.get_data_loaders(d)
         test_loaders[d] = test_loader
 
@@ -253,14 +260,19 @@ def evaluate_cross_domain(domains):
         print(f"\n[Source Model: {source}] Loading weights...")
 
         model = build_network(source).to(Data.device)
-        # Loading from the _224 version
-        model_path = f"./classifiers_new/{source}_classifier.pt"
+
+        # --- עדכון נתיבים מאוחד ---
+        # מחפש קודם את הגרסה החדשה (_224) ואז את הגרסה הישנה (_classifier) בתיקייה המאוחדת
+        p1 = f"./classifiers/{source}_224.pt"
+        p2 = f"./classifiers/{source}_classifier.pt"
+        model_path = p1 if os.path.exists(p1) else p2
 
         if not os.path.exists(model_path):
-            print(f"[WARNING] Model for {source} not found at {model_path}. Skipping.")
+            print(f"[WARNING] Model for {source} not found in ./classifiers/. Skipping.")
             continue
 
         try:
+            # הוספת weights_only=True מומלצת כדי להימנע מהודעת האזהרה שקיבלת בטרמינל
             model.load_state_dict(torch.load(model_path, map_location=Data.device))
             model.eval()
         except Exception as e:
@@ -273,7 +285,7 @@ def evaluate_cross_domain(domains):
             total = 0
 
             with torch.no_grad():
-                for data, lbl in loader:
+                for i, (data, lbl) in enumerate(loader):
                     if data.dim() == 3: data = data.unsqueeze(1)
                     data = data.to(Data.device)
                     lbl = lbl.to(Data.device)
@@ -282,6 +294,10 @@ def evaluate_cross_domain(domains):
                     preds = output.argmax(dim=1)
                     correct += preds.eq(lbl).sum().item()
                     total += lbl.size(0)
+
+                    # הדפסת התקדמות קלה כדי שלא ייראה תקוע
+                    if i % 20 == 0:
+                        print(f"   [Eval] {source} -> {target}: Batch {i}/{len(loader)}", end='\r')
 
             accuracy = correct / total
             error = 1.0 - accuracy
@@ -312,12 +328,13 @@ if __name__ == '__main__':
     save_dir = "./classifiers"
     os.makedirs(save_dir, exist_ok=True)
 
-    # CASE 2: Office-Home
+    # CASE 2: Office-Home--------
     # domains_to_run = ['Art', 'Clipart', 'Product', 'Real World']
-    domains_to_run = ['amazon', 'dslr', 'webcam']
+    # domains_to_run = ['amazon', 'dslr', 'webcam']
+    domains_to_run = ['clipart', 'infograph', 'painting' , 'quickdraw', 'real', 'sketch']
     print(f"Running for domains: {domains_to_run}")
 
-    num_jobs = 2
+    num_jobs = 1
 
     results = Parallel(n_jobs=num_jobs, backend="loky")(
         delayed(parallel_wrapper)(d) for d in domains_to_run

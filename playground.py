@@ -1,570 +1,366 @@
 import os
-import sys
+import re
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import joblib
 import ast
-import itertools
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, Subset
-from torchvision import models, transforms, datasets
-from scipy.special import logsumexp
-
 
 # ==========================================
-# --- JSD MODE FLAG ---
-# ==========================================
-# Choose how to estimate JSD:
-#   "REAL" -> use real Z from the test set (may yield negative values due to model mismatch)
-#   "GMM"  -> sample Z directly from the GMMs (JSD should be >= 0 up to MC noise)
-JSD_ESTIMATION_MODE = "GMM"   # <-- change to "REAL" if you want the old behavior
-JSD_NUM_SAMPLES = 2000        # samples per distribution when mode="GMM"
-JSD_SEED = 0                  # reproducibility
-JSD_CLIP_AT_ZERO = True       # clip tiny negative due to Monte-Carlo noise (recommended for "GMM")
-
-# --- JSD MIX WEIGHTS FLAG ---
-# "EQUAL" -> alpha=0.5 always
-# "TRUE"  -> alpha is taken from TRUE RATIOS in the results file (normalized to the pair)
-JSD_MIX_WEIGHTS_MODE = "TRUE"   # "EQUAL" or "TRUE"
-JSD_NORMALIZE_BY_WEIGHT_ENTROPY = False  # optional: divide by H([a,1-a]) to make comparable across mixes
-
-# ==========================================
-# --- CONFIGURATION ---
+# --- CONFIGURATION & PATHS ---
 # ==========================================
 BASE_ROOT_DIR = "/data/nogaz/Convex_bounds_optimization"
 BASE_EXP_DIR = os.path.join(BASE_ROOT_DIR, "LatentFlow_Pixel_Experiments")
 
-OFFICEHOME_DIR = os.path.join(BASE_ROOT_DIR, "OfficeHome")
-OFFICE31_DIR = os.path.join(BASE_ROOT_DIR, "Office-31")
-
 DATASET_CONFIGS = {
     "OFFICE31": {
         "DOMAINS": ['amazon', 'dslr', 'webcam'],
-        "CLASSES": 31,
-        "INPUT_DIM": 2048,
         "MODELS_DIR": os.path.join(BASE_EXP_DIR, "models", "gmm_models_soft"),
         "RESULTS_FILE": os.path.join(BASE_ROOT_DIR,
-                                     "results_OFFICE31_recreate/seed_1/Sweep_Results_1_PRE_D_True_art_ratios_True.txt"),
-        "DATA_DIR": OFFICE31_DIR
+                                     "results_OFFICE31_mosek/seed_1/Sweep_Results_1_3_sets_with_config.txt"),
     },
     "OFFICE224": {
         "DOMAINS": ['Art', 'Clipart', 'Product', 'Real World'],
-        "CLASSES": 65,
-        "INPUT_DIM": 2048,
         "MODELS_DIR": os.path.join(BASE_EXP_DIR, "models", "gmm_models_soft_officehome"),
         "RESULTS_FILE": os.path.join(BASE_ROOT_DIR,
-                                     "results_OFFICE224_recreate/seed_1/Sweep_Results_1_PRE_D_True_art_ratios_True.txt"),
-        "DATA_DIR": OFFICEHOME_DIR
+                                     "results_OFFICE224_mosek/seed_1/Sweep_Results_1_3_sets_with_config.txt"),
     }
 }
 
-OUTPUT_DIR = os.path.join(BASE_EXP_DIR, "analysis", "solver_analysis_sampled_data_w")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+OUTPUT_DIR = os.path.join(BASE_EXP_DIR, "analysis", "pairs_analysis_fix")
+PAIRS_DIR = os.path.join(OUTPUT_DIR, "per_pair_detailed")
+os.makedirs(PAIRS_DIR, exist_ok=True)
 
 
 # ==========================================
-# --- ASSETS LOADING ---
+# --- JSD CALCULATION ---
 # ==========================================
-class FeatureExtractor(nn.Module):
-    def __init__(self, original_model):
-        super(FeatureExtractor, self).__init__()
-        self.backbone = nn.Sequential(*list(original_model.children())[:-1])
-        self.head = original_model.fc
-
-    def forward(self, x):
-        feats = torch.flatten(self.backbone(x), 1)
-        return feats, self.head(feats)
-
-
-class TransformedSubset(torch.utils.data.Dataset):
-    def __init__(self, subset, transform):
-        self.subset = subset
-        self.transform = transform
-
-    def __getitem__(self, index):
-        x, y = self.subset[index]
-        if self.transform: x = self.transform(x)
-        return x, y
-
-    def __len__(self): return len(self.subset)
+def calculate_jsd(gmm_p, gmm_q, alpha=0.5):
+    n_samples = 2000
+    Xp, _ = gmm_p.sample(n_samples)
+    Xq, _ = gmm_q.sample(n_samples)
+    lp_p, lq_p = gmm_p.score_samples(Xp), gmm_q.score_samples(Xp)
+    lp_q, lq_q = gmm_p.score_samples(Xq), gmm_q.score_samples(Xq)
+    a, b = alpha, 1.0 - alpha
+    log_m_p = np.logaddexp(np.log(a) + lp_p, np.log(b) + lq_p)
+    log_m_q = np.logaddexp(np.log(a) + lp_q, np.log(b) + lq_q)
+    return max(0.0, float(a * np.mean(lp_p - log_m_p) + b * np.mean(lq_q - log_m_q)))
 
 
-def get_test_loader(dataset_name, domain, seed=1, batch_size=64):
-    cfg = DATASET_CONFIGS[dataset_name]
-    candidates = [
-        os.path.join(cfg['DATA_DIR'], domain, "images"),
-        os.path.join(cfg['DATA_DIR'], domain),
-        os.path.join(cfg['DATA_DIR'], "images", domain)
-    ]
-    path = None
-    for p in candidates:
-        if os.path.exists(p):
-            path = p
-            break
-    if not path:
-        return None
-
-    ds_full = datasets.ImageFolder(path)
-    N = len(ds_full)
-    rng = np.random.RandomState(seed)
-    indices = rng.permutation(N)
-    split_point = int(0.8 * N)
-    test_idx = indices[split_point:]
-
-    tr_test = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-    test_ds = TransformedSubset(Subset(ds_full, test_idx), tr_test)
-    return DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
-
-
-def load_assets(dataset_name):
-    cfg = DATASET_CONFIGS[dataset_name]
-    classifiers = {}
-    for d in cfg['DOMAINS']:
-        possible_paths = [
-            f"./classifiers/{d}_224.pt",
-            f"./classifiers/{d}_classifier.pt",
-            f"./classifiers_new/{d}_classifier.pt",
-            os.path.join(BASE_ROOT_DIR, "classifiers_new", f"{d}_classifier.pt"),
-            os.path.join(BASE_ROOT_DIR, "classifiers", f"{d}_classifier.pt")
-        ]
-        for path in possible_paths:
-            if os.path.exists(path):
-                m = models.resnet50(weights=None)
-                m.fc = nn.Linear(m.fc.in_features, cfg['CLASSES'])
-                try:
-                    m.load_state_dict(torch.load(path, map_location=device))
-                    classifiers[d] = FeatureExtractor(m).to(device).eval()
-                    break
-                except:
-                    pass
-
-    try:
-        scaler = joblib.load(os.path.join(cfg['MODELS_DIR'], "global_scaler.pkl"))
-        pca = joblib.load(os.path.join(cfg['MODELS_DIR'], "global_pca.pkl"))
-        gmms = {}
-        for d in cfg['DOMAINS']:
-            gmms[d] = joblib.load(os.path.join(cfg['MODELS_DIR'], f"gmm_{d}.pkl"))
-    except:
-        return None, None, None, None
-
-    return classifiers, scaler, pca, gmms
-
-
-@torch.no_grad()
-def get_real_z(dataset_name, classifiers, scaler, pca):
-    cfg = DATASET_CONFIGS[dataset_name]
-    z_data = {}
-    for d in cfg['DOMAINS']:
-        if d not in classifiers: continue
-        loader = get_test_loader(dataset_name, d)
-        if not loader: continue
-        feats_list = []
-        for imgs, _ in loader:
-            imgs = imgs.to(device)
-            f, _ = classifiers[d](imgs)
-            feats_list.append(f.cpu().numpy())
-        if feats_list:
-            raw = np.concatenate(feats_list)
-            z = pca.transform(scaler.transform(raw))
-            z_data[d] = z
-    return z_data
-
-
-import re
-import numpy as np
-import ast
-import os
-
-def parse_results_strict(filepath):
-    if not os.path.exists(filepath):
-        return []
+# ==========================================
+# --- ENHANCED PARSER ---
+# ==========================================
+def parse_detailed_results(filepath, dataset_name):
+    if not os.path.exists(filepath): return []
     with open(filepath, 'r') as f:
         content = f.read()
-
-    data = []
-    blocks = content.split("TARGET:")[1:]
-
-    BASELINE_NAMES = ["UNIFORM", "ORACLE", "ORACLE_ANY", "ORACLE_ANY_CORRECT", "Solver"]
+    data, blocks = [], content.split("TARGET:")[1:]
 
     for block in blocks:
-        lines = block.strip().split('\n')
-        header = lines[0].strip()
-
-        # --- parse header line robustly ---
-        # Example:
-        # "['amazon', 'dslr'] | TRUE RATIOS: [0.2 0.8 0. ]"
+        lines = [l.strip() for l in block.strip().split('\n') if l]
         try:
-            left, right = header.split("| TRUE RATIOS:")
-            target_list = ast.literal_eval(left.strip())
+            target_list = ast.literal_eval(lines[0].split('|')[0].strip())
+            if len(target_list) != 2: continue
 
-            # ratios may come without commas => parse floats via regex
-            ratio_str = right.strip()
-            nums = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", ratio_str)
-            true_ratios = np.array([float(x) for x in nums], dtype=float)
+            baselines = {}
+            ratios = None
 
-            if len(target_list) < 2 or true_ratios.size == 0:
-                continue
-            target_set = frozenset(target_list)
-        except:
+            for l in lines:
+                if "UNIFORM" in l:
+                    baselines['Uniform'] = float(l.split('|')[3])
+
+                if "ORACLE " in l:
+                    baselines['Oracle'] = float(l.split('|')[3])
+
+                if "RATIOS:" in l:
+                    ratios = [float(x) for x in re.findall(r"[-+]?\d*\.?\d+", l)]
+
+                if "DC (" in l:
+                    m_match = re.search(r"(\d+\.\d+)\s*±\s*(\d+\.\d+)", l)
+                    if m_match:
+                        baselines['Mean_DC'] = float(m_match.group(1))
+                        baselines['DC_Std'] = float(m_match.group(2))
+
+            mean_dc = baselines.get('Mean_DC', baselines.get('Uniform', 0.0))
+            dc_std = baselines.get('DC_Std', 0.0)
+            for l in lines:
+                if "acc_Q:" in l and "|" in l:
+                    if "nan" in l.lower() or "inf" in l.lower(): continue
+
+                    parts = [p.strip() for p in l.split('|')]
+
+                    # --- התיקון המרכזי כאן ---
+                    # אנחנו לוקחים את החלק הראשון ומנקים אותו
+                    raw_algo = parts[0].split()[0] if parts[0] else ""
+
+                    # סינון: רק אם זה מתחיל ב-3. (גרסאות האלגוריתם) או מכיל CVXPY
+                    # זה מונע מפרמטרים כמו m=1.0 להיכנס בטעות כאלגוריתם
+                    if not (raw_algo.startswith("3.") or "CVXPY" in raw_algo):
+                        continue
+
+                    algo = raw_algo
+                    backend = parts[1]
+                    m_val = float(re.search(r"m:([\d\.]+)", parts[2]).group(1))
+                    acc_q = float(re.search(r"acc_Q:\s*([\d\.]+)", l).group(1))
+
+                    data.append({
+                        "Dataset": dataset_name,
+                        "Pair": f"{target_list[0][:2]}-{target_list[1][:2]}",
+                        "Algorithm": algo,
+                        "Backend": backend,
+                        "m": m_val,
+                        "Accuracy": acc_q,
+                        "Gain": acc_q - mean_dc,
+                        "Oracle": baselines.get('Oracle'),
+                        "Mean_DC": mean_dc,
+                        "DC_Std": dc_std,
+                        "Target_List": target_list,
+                        "Ratios": ratios
+                    })
+
+        except Exception as e:
+            print(f"Failed parsing block in {dataset_name}: {e}")
             continue
-
-        scores = {}
-        dc_vals = []
-
-        for line in lines:
-            if "|" in line:
-                parts = [p.strip() for p in line.split('|')]
-                if len(parts) >= 4:
-                    name = parts[0]
-                    acc_str = parts[3]
-                    try:
-                        if 'acc_' in acc_str:
-                            val = float(acc_str.split(':')[1])
-                        elif '±' in acc_str:
-                            val = float(acc_str.split('±')[0])
-                        else:
-                            val = float(acc_str)
-
-                        if name not in scores or val > scores[name]:
-                            scores[name] = val
-                        if "DC" in name:
-                            dc_vals.append(val)
-                    except:
-                        pass
-
-        uniform = scores.get("UNIFORM")
-        oracle  = scores.get("ORACLE")
-
-        best_new_solver_acc = -1
-        best_new_solver_name = "None"
-        for name, val in scores.items():
-            if (name not in BASELINE_NAMES) and ("DC" not in name):
-                if val > best_new_solver_acc:
-                    best_new_solver_acc = val
-                    best_new_solver_name = name
-
-        worst_dc = min(dc_vals) if dc_vals else None
-
-        if uniform is not None and best_new_solver_acc > 0:
-            d1_short = target_list[0][:2]
-            d2_short = target_list[1][:2]
-            label = f"{d1_short}-{d2_short}"
-
-            data.append({
-                "Target_Set": target_set,
-                "Target_List": target_list,
-                "True_Ratios": true_ratios,
-                "Label": label,
-                "Dataset": "Unknown",
-                "Acc_Uniform": uniform,
-                "Acc_Oracle": oracle,
-                "Acc_Best_New": best_new_solver_acc,
-                "Acc_Worst_DC": worst_dc,
-                "Solver_Name": best_new_solver_name,
-                "Gain_Uniform": best_new_solver_acc - uniform,
-                "Gain_Worst_DC": (best_new_solver_acc - worst_dc) if worst_dc is not None else None,
-                "Gain_Oracle": (best_new_solver_acc - oracle) if oracle is not None else None
-            })
-
     return data
 
-
 # ==========================================
-# --- PARSING RESULTS (STRICT + ORACLE) ---
+# --- VISUALIZATION MASTER ---
 # ==========================================
-def plot_with_regression(df, y_col, y_label, title, filename):
-    plt.figure(figsize=(12, 8))
-    sns.set_style("whitegrid")
+def generate_extensive_visuals(df):
+    print("\n🔍 --- Diagnostic Start ---")
 
-    datasets = sorted(df['Dataset'].unique())
-    palette = sns.color_palette("bright", len(datasets))
-    color_map = dict(zip(datasets, palette))
+    df['Algorithm'] = df['Algorithm'].astype(str).str.strip()
+    df['Backend'] = df['Backend'].astype(str).str.strip()
 
-    # Points
-    sns.scatterplot(
-        data=df, x='JSD', y=y_col, hue='Dataset',
-        style='Dataset', palette=color_map,
-        s=250, edgecolor='k', alpha=0.9, zorder=3
+    allowed_algos = sorted([a for a in df['Algorithm'].unique() if a.startswith('3.') or 'CVXPY' in a])
+    allowed_backends = sorted([b for b in df['Backend'].unique() if not re.match(r'^-?\d+\.?\d*$', b)])
+
+    df = df[df['Algorithm'].isin(allowed_algos) & df['Backend'].isin(allowed_backends)].copy()
+
+    print(f"Algorithms for plot: {allowed_algos}")
+    print(f"Backends for plot: {allowed_backends}")
+    print(f"Total rows to plot: {len(df)}")
+    print("--- Diagnostic End ---\n")
+
+    sns.set_theme(style="whitegrid", context="talk")
+    df['sqrt_JSD'] = np.sqrt(df['JSD'])
+
+
+
+    group_cols = ['Dataset', 'Pair', 'Algorithm', 'm', 'sqrt_JSD']
+
+    idx_best_backend = df.groupby(group_cols)['Gain'].idxmax()
+    df_best_backend = df.loc[idx_best_backend].copy()
+    plt.figure(figsize=(14, 10))
+
+    ax = sns.scatterplot(
+        data=df_best_backend,
+        x='sqrt_JSD',
+        y='Gain',
+        hue='Algorithm',
+        hue_order=allowed_algos,
+        alpha=0.7,
+        s=100,
+        palette='viridis'
     )
 
-    # Regression
-    # for ds in datasets:
-    #     subset = df[df['Dataset'] == ds]
-    #     if len(subset) > 1 and subset['JSD'].nunique() > 1:
-    #         sns.regplot(
-    #             data=subset, x='JSD', y=y_col, scatter=False,
-    #             color=color_map[ds], ax=plt.gca(), ci=None,
-    #             line_kws={'linestyle': '--', 'linewidth': 2, 'alpha': 0.7},
-    #             truncate=False
-    #         )
-
-    # Baseline (0) if Gain
-    if "Gain" in y_col:
-        plt.axhline(0, color='gray', linestyle='-', linewidth=1.5, zorder=1)
-
-    # Labels
-    for i, row in df.iterrows():
-        if pd.notna(row['JSD']) and pd.notna(row[y_col]):
-            txt_color = 'red' if row[y_col] < 0 else 'black'
-            # Adjust offset for negative values so text doesn't overlap line
-            offset = 0.4 if row[y_col] >= 0 else -0.6
-
-            plt.text(
-                row['JSD'], row[y_col] + offset,
-                row['Label'], fontsize=10, weight='bold',
-                ha='center', color=txt_color, zorder=4
-            )
-
-    plt.title(title, fontsize=18, fontweight='bold', pad=15)
-    plt.xlabel("Symmetric JSD (Closer to 0 = More Similar)", fontsize=14)
-    plt.ylabel(y_label, fontsize=14)
-    plt.legend(loc='best', fontsize=12, frameon=True, title="Dataset")
-    plt.grid(True, linestyle=':', alpha=0.6)
+    plt.axhline(0, color='red', linestyle='--', linewidth=2, label='DC Baseline')
+    plt.title("All Permutations: Gain vs. $\sqrt{JSD}$", fontsize=20)
+    plt.xlabel("$\sqrt{JSD}$ (Distance)", fontsize=16)
+    plt.ylabel("Gain over Mean DC (%)", fontsize=16)
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', title="Algorithm")
     plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, "1_All_Permutations_Scatter.png"), dpi=300)
+    plt.close()
 
-    path = os.path.join(OUTPUT_DIR, filename)
-    plt.savefig(path, dpi=300)
-    print(f"✅ Saved plot: {path}")
+    # --- 1A. Scatter with error bars: best backend per point ---
+    plt.figure(figsize=(14, 10))
+
+    colors = dict(zip(allowed_algos, sns.color_palette('viridis', n_colors=len(allowed_algos))))
+
+    for algo in allowed_algos:
+        sub = df_best_backend[df_best_backend['Algorithm'] == algo]
+        if sub.empty:
+            continue
+
+        plt.errorbar(
+            sub['sqrt_JSD'],
+            sub['Gain'],
+            yerr=sub['DC_Std'],
+            fmt='o',
+            linestyle='none',
+            color=colors[algo],
+            alpha=0.7,
+            markersize=7,
+            capsize=3,
+            label=algo
+        )
+
+    plt.axhline(0, color='red', linestyle='--', linewidth=2, label='DC Baseline')
+    plt.title("All Permutations: Gain vs. $\sqrt{JSD}$ with $\pm 1$ Std. DC Error Bars", fontsize=20)
+    plt.xlabel("$\sqrt{JSD}$ (Distance)", fontsize=16)
+    plt.ylabel("Gain over Mean DC (%)", fontsize=16)
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', title="Algorithm")
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, "1A_All_Permutations_Scatter_With_ErrorBars.png"), dpi=300)
     plt.close()
 
 
-# ==========================================
-# --- PLOTTING ---
-# def calculate_empirical_jsd(gmm_p, gmm_q, Z_p, Z_q):
-#     n_max = 2000
-#     if len(Z_p) > n_max: Z_p = Z_p[np.random.choice(len(Z_p), n_max, replace=False)]
-#     if len(Z_q) > n_max: Z_q = Z_q[np.random.choice(len(Z_q), n_max, replace=False)]
-#     ll_p_xp = gmm_p.score_samples(Z_p)
-#     ll_q_xp = gmm_q.score_samples(Z_p)
-#     ll_p_xq = gmm_p.score_samples(Z_q)
-#     ll_q_xq = gmm_q.score_samples(Z_q)
-#     log_m_xp = -np.log(2) + np.logaddexp(ll_p_xp, ll_q_xp)
-#     log_m_xq = -np.log(2) + np.logaddexp(ll_p_xq, ll_q_xq)
-#     kl_p_m = np.mean(ll_p_xp - log_m_xp)
-#     kl_q_m = np.mean(ll_q_xq - log_m_xq)
-#     return 0.5 * kl_p_m + 0.5 * kl_q_m
+    win_rows = []
 
-def _entropy_2(a):
-    a = float(a)
-    b = 1.0 - a
-    eps = 1e-15
-    a = np.clip(a, eps, 1 - eps)
-    b = np.clip(b, eps, 1 - eps)
-    return - (a * np.log(a) + b * np.log(b))
+    for pair, pdf in df.groupby('Pair'):
+        max_gain = pdf['Gain'].max()
+        winners = pdf[np.isclose(pdf['Gain'], max_gain)]
 
-def _jsd_from_loglikes(ll_p_xp, ll_q_xp, ll_p_xq, ll_q_xq, alpha=0.5, normalize=False):
-    """
-    Weighted JSD:
-      M = alpha P + (1-alpha) Q
-      JSD = alpha * E_{x~P}[log p - log m] + (1-alpha) * E_{x~Q}[log q - log m]
-    """
-    eps = 1e-15
-    a = float(np.clip(alpha, eps, 1 - eps))
-    b = 1.0 - a
+        is_tie = len(winners) > 1
+        for _, row in winners.iterrows():
+            win_rows.append({
+                'Solver': f"{row['Algorithm']} | {row['Backend']}",
+                'WinType': 'Tied First' if is_tie else 'Solo First'
+            })
 
-    # log m(x) = log( a * p(x) + b * q(x) )
-    log_m_xp = np.logaddexp(np.log(a) + ll_p_xp, np.log(b) + ll_q_xp)
-    log_m_xq = np.logaddexp(np.log(a) + ll_p_xq, np.log(b) + ll_q_xq)
+    wins_df = pd.DataFrame(win_rows)
 
-    kl_p_m = np.mean(ll_p_xp - log_m_xp)  # E_{P}[log p - log m]
-    kl_q_m = np.mean(ll_q_xq - log_m_xq)  # E_{Q}[log q - log m]
+    if not wins_df.empty:
+        win_summary = (
+            wins_df.groupby(['Solver', 'WinType'])
+            .size()
+            .unstack(fill_value=0)
+            .reset_index()
+        )
 
-    jsd = a * kl_p_m + b * kl_q_m
+        solver_order = [
+            f"{algo} | {backend}"
+            for algo in allowed_algos
+            for backend in allowed_backends
+            if f"{algo} | {backend}" in win_summary['Solver'].values
+        ]
 
-    if normalize:
-        H = _entropy_2(a)          # upper bound of weighted JSD
-        jsd = jsd / max(H, 1e-12)  # avoid div by 0
+        win_summary = win_summary.set_index('Solver').reindex(solver_order, fill_value=0)
+        for col in ['Solo First', 'Tied First']:
+            if col not in win_summary.columns:
+                win_summary[col] = 0
 
-    return float(jsd)
+        plt.figure(figsize=(14, 7))
+        win_summary[['Solo First', 'Tied First']].plot(
+            kind='bar',
+            stacked=True,
+            ax=plt.gca()
+        )
+        plt.title("Number of Pair Wins per Solver (Solo vs Tie)", fontsize=18)
+        plt.xlabel("Solver")
+        plt.ylabel("Count of First-Place Finishes")
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUTPUT_DIR, "2_Algorithm_vs_Backend_Comparison.png"))
+        plt.close()
 
+    plt.figure(figsize=(10, 6))
+    summary = df.groupby(['Algorithm', 'Backend'])['Gain'].mean().reset_index()
+    sns.barplot(data=summary, x='Algorithm', y='Gain', hue='Backend',
+                order=allowed_algos, hue_order=allowed_backends)
+    plt.title("Average Improvement per Solver Configuration", fontsize=16)
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, "3_Average_Improvement_Bar.png"))
 
+    plt.figure(figsize=(12, 8))
 
-def calculate_jsd(gmm_p, gmm_q, Z_p=None, Z_q=None,
-                  mode="REAL", n_samples=2000, seed=0,
-                  clip_at_zero=False, alpha=0.5, normalize=False):
+    win_rows_4 = []
 
-    rng = np.random.RandomState(seed)
+    for pair, pdf in df.groupby('Pair'):
+        max_gain = pdf['Gain'].max()
+        winners = pdf[np.isclose(pdf['Gain'], max_gain)].copy()
 
-    if mode.upper() == "REAL":
-        if Z_p is None or Z_q is None:
-            raise ValueError("REAL mode requires Z_p and Z_q.")
-        if len(Z_p) > n_samples:
-            Z_p = Z_p[rng.choice(len(Z_p), n_samples, replace=False)]
-        if len(Z_q) > n_samples:
-            Z_q = Z_q[rng.choice(len(Z_q), n_samples, replace=False)]
+        # חשוב: לא לספור אותו אלגוריתם פעמיים בגלל backend שונה
+        winning_algorithms = sorted(winners['Algorithm'].unique())
 
-        ll_p_xp = gmm_p.score_samples(Z_p)
-        ll_q_xp = gmm_q.score_samples(Z_p)
-        ll_p_xq = gmm_p.score_samples(Z_q)
-        ll_q_xq = gmm_q.score_samples(Z_q)
+        is_tie = len(winning_algorithms) > 1
 
-        jsd = _jsd_from_loglikes(ll_p_xp, ll_q_xp, ll_p_xq, ll_q_xq, alpha=alpha, normalize=normalize)
+        for algo in winning_algorithms:
+            win_rows_4.append({
+                'Algorithm': algo,
+                'WinType': 'Tied First' if is_tie else 'Solo First'
+            })
 
-    elif mode.upper() == "GMM":
-        gmm_p.random_state = seed
-        gmm_q.random_state = seed + 1
+    wins4_df = pd.DataFrame(win_rows_4)
 
-        Xp, _ = gmm_p.sample(n_samples)
-        Xq, _ = gmm_q.sample(n_samples)
+    if not wins4_df.empty:
+        win4_summary = (
+            wins4_df.groupby(['Algorithm', 'WinType'])
+            .size()
+            .unstack(fill_value=0)
+            .reindex(allowed_algos, fill_value=0)
+        )
 
-        ll_p_xp = gmm_p.score_samples(Xp)
-        ll_q_xp = gmm_q.score_samples(Xp)
-        ll_p_xq = gmm_p.score_samples(Xq)
-        ll_q_xq = gmm_q.score_samples(Xq)
+        for col in ['Solo First', 'Tied First']:
+            if col not in win4_summary.columns:
+                win4_summary[col] = 0
 
-        jsd = _jsd_from_loglikes(ll_p_xp, ll_q_xp, ll_p_xq, ll_q_xq, alpha=alpha, normalize=normalize)
+        win4_summary = win4_summary[['Solo First', 'Tied First']]
 
-    else:
-        raise ValueError(f"Unknown mode={mode}. Use 'REAL' or 'GMM'.")
+        win4_summary.plot(
+            kind='bar',
+            stacked=True,
+            figsize=(12, 8)
+        )
 
-    if clip_at_zero:
-        jsd = max(0.0, float(jsd))
+        plt.title("Number of Pairs Where Algorithm Reached First Place", fontsize=18)
+        plt.xlabel("Algorithm")
+        plt.ylabel("Count")
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUTPUT_DIR, "4_Win_Count_Per_Algo.png"))
+        plt.close()
 
-    return float(jsd)
+    for pair in df['Pair'].unique():
+        pdf = df[df['Pair'] == pair]
+        if pdf.empty: continue
+        plt.figure(figsize=(12, 7))
+        sns.lineplot(data=pdf, x='m', y='Accuracy', hue='Algorithm', style='Backend',
+                     marker='o', hue_order=allowed_algos, style_order=allowed_backends)
 
-# ==========================================
+        plt.axhline(pdf['Oracle'].iloc[0], color='green', label='Oracle', linestyle=':')
+        plt.axhline(pdf['Mean_DC'].iloc[0], color='red', label='Mean DC', linestyle='-.')
+        plt.title(f"Detailed Mix Analysis: {pair} (Dist: {pdf['sqrt_JSD'].iloc[0]:.3f})")
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.tight_layout()
+        plt.savefig(os.path.join(PAIRS_DIR, f"Detail_{pair}.png"))
+        plt.close()
 
-def sanity_check_jsd_xx(gmms, real_z=None, mode="GMM"):
-    print("\n🔎 Sanity check: JSD(X, X) should be ~0")
-    for d, gmm in gmms.items():
-        try:
-            if mode.upper() == "REAL":
-                if real_z is None or d not in real_z:
-                    print(f"   {d}: (skipped - no real Z)")
-                    continue
-                val = calculate_jsd(gmm, gmm, Z_p=real_z[d], Z_q=real_z[d],
-                                    mode="REAL", n_samples=JSD_NUM_SAMPLES, seed=JSD_SEED,
-                                    clip_at_zero=False)
-            else:
-                val = calculate_jsd(gmm, gmm, mode="GMM",
-                                    n_samples=JSD_NUM_SAMPLES, seed=JSD_SEED,
-                                    clip_at_zero=JSD_CLIP_AT_ZERO)
-            print(f"   {d}: JSD({d},{d}) = {val:.6f}")
-        except Exception as e:
-            print(f"   {d}: ERROR {repr(e)}")
 
 # ==========================================
 # --- MAIN ---
 # ==========================================
 def main():
-    print("🚀 Starting Analysis (Strict Separation + ORACLE)...")
+    print("🚀 Running Extensive Analysis...")
     all_rows = []
-
-    for mode in ["OFFICE31", "OFFICE224"]:
-        print(f"\n--- Processing {mode} ---")
-        clf, scaler, pca, gmms = load_assets(mode)
-        if not clf:
+    for ds_name, cfg in DATASET_CONFIGS.items():
+        print(f"Processing {ds_name}...")
+        try:
+            gmms = {d: joblib.load(os.path.join(cfg['MODELS_DIR'], f"gmm_{d}.pkl")) for d in cfg['DOMAINS']}
+        except Exception as e:
+            print(f"Failed parsing block in {dataset_name}: {e}")
             continue
 
-        real_z = get_real_z(mode, clf, scaler, pca)
-        results = parse_results_strict(DATASET_CONFIGS[mode]['RESULTS_FILE'])
-        # --- Sanity check JSD(X,X) ---
-        sanity_check_jsd_xx(gmms, real_z=real_z, mode=JSD_ESTIMATION_MODE)
+        results = parse_detailed_results(cfg['RESULTS_FILE'], ds_name)
+        for row in results:
+            d1, d2 = row['Target_List']
+            doms = cfg['DOMAINS']
+            r1 = row['Ratios'][doms.index(d1)]
+            r2 = row['Ratios'][doms.index(d2)]
 
-        for res in results:
-            # ✅ use ordered list from file (not set)
-            t_list = res.get("Target_List", None)
-            if not t_list:
-                t_list = list(res["Target_Set"])
+            alpha = r1 / (r1 + r2) if (r1 + r2) > 0 else 0.5
+            row['JSD'] = calculate_jsd(gmms[d1], gmms[d2], alpha=alpha)
+            all_rows.append(row)
 
-            # ✅ keep only true 2-domain mixes
-            if len(t_list) != 2:
-                continue
-
-            d1 = str(t_list[0]).strip()
-            d2 = str(t_list[1]).strip()
-
-            if d1 in real_z and d2 in real_z:
-                # -------------------------------
-                # NEW: choose alpha (mix weight) for weighted JSD
-                # -------------------------------
-                alpha = 0.5  # default: equal mix
-                if JSD_MIX_WEIGHTS_MODE.upper() == "TRUE":
-                    ratios = res.get("True_Ratios", None)  # <-- correct key name
-                    if ratios is not None:
-                        all_domains = DATASET_CONFIGS[mode]["DOMAINS"]
-                        try:
-                            idx1 = all_domains.index(d1)
-                            idx2 = all_domains.index(d2)
-                            r1 = float(ratios[idx1])
-                            r2 = float(ratios[idx2])
-                            s = r1 + r2
-                            alpha = (r1 / s) if s > 0 else 0.5
-                        except Exception:
-                            alpha = 0.5  # fallback safely
-
-                # jsd_val = calculate_empirical_jsd(gmms[d1], gmms[d2], real_z[d1], real_z[d2])
-                if JSD_ESTIMATION_MODE.upper() == "REAL":
-                    jsd_val = calculate_jsd(
-                        gmms[d1], gmms[d2],
-                        Z_p=real_z[d1], Z_q=real_z[d2],
-                        mode="REAL", n_samples=JSD_NUM_SAMPLES, seed=JSD_SEED,
-                        clip_at_zero=False,  # keep raw (can be negative)
-                        alpha=alpha,
-                        normalize=JSD_NORMALIZE_BY_WEIGHT_ENTROPY
-                    )
-                else:
-                    jsd_val = calculate_jsd(
-                        gmms[d1], gmms[d2],
-                        mode="GMM", n_samples=JSD_NUM_SAMPLES, seed=JSD_SEED,
-                        clip_at_zero=JSD_CLIP_AT_ZERO,
-                        alpha=alpha,
-                        normalize=JSD_NORMALIZE_BY_WEIGHT_ENTROPY
-                    )
-
-                res['JSD'] = jsd_val
-                res['Dataset'] = mode
-                all_rows.append(res)
-
-                # Debug Print
-                gain_u = res['Gain_Uniform']
-                gain_oracle = res['Gain_Oracle']
-
-                status_u = "🟢" if gain_u >= 0 else "🔴"
-                status_or = "🟢" if (gain_oracle is not None and gain_oracle >= 0) else "🔴"  # Rare
-
-                print(f"   [{mode}] {res['Label']} | JSD: {jsd_val:.2f} | Best: {res['Acc_Best_New']:.2f}")
-                print(f"       -> vs Uniform: {gain_u:.2f} {status_u}")
-                print(f"       -> vs Oracle:  {gain_oracle:.2f} {status_or}")
-            else:
-                print(f"   Skipping {res['Label']} (Missing Z data)")
-
-    if not all_rows:
-        print("❌ No data.")
-        return
-
-    df = pd.DataFrame(all_rows)
-    print(f"\n📊 Total Points: {len(df)}")
-
-    # 1. Abs Acc of BEST NEW
-    plot_with_regression(df, 'Acc_Best_New', 'Best New Solver Accuracy (%)', 'Absolute Accuracy vs. JSD',
-                         '1_Abs_Acc.png')
-
-    # 2. Gain vs Uniform
-    plot_with_regression(df, 'Gain_Uniform', 'Accuracy Gain (%) vs Uniform',
-                         'Improvement (New Solver) over Uniform vs. JSD', '2_Gain_Uniform.png')
-
-    # 3. Gain vs Worst DC
-    df_dc = df.dropna(subset=['Gain_Worst_DC'])
-    if not df_dc.empty:
-        plot_with_regression(df_dc, 'Gain_Worst_DC', 'Accuracy Gain (%) vs Worst DC',
-                             'Improvement (New Solver) over Worst DC vs. JSD', '3_Gain_WorstDC.png')
-
-    # 4. Gain vs Oracle
-    df_or = df.dropna(subset=['Gain_Oracle'])
-    if not df_or.empty:
-        plot_with_regression(df_or, 'Gain_Oracle', 'Distance from Oracle (%)', 'Gap to ORACLE (Ideal) vs. JSD',
-                             '4_Gap_Oracle.png')
-
-    print(f"\n✅ All Done. Folder: {OUTPUT_DIR}")
+    if all_rows:
+        df = pd.DataFrame(all_rows)
+        df = df[df['Algorithm'].apply(lambda x: str(x).startswith('3.') or 'CVXPY' in str(x))].copy()
+        generate_extensive_visuals(df)
+        df.to_csv(os.path.join(OUTPUT_DIR, "complete_permutations_data.csv"), index=False)
+        print(f"✅ Success! Data saved in: {OUTPUT_DIR}")
 
 
 if __name__ == "__main__":
