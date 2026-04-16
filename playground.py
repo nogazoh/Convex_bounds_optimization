@@ -70,7 +70,7 @@ def parse_detailed_results(filepath, dataset_name):
                 if "UNIFORM" in l:
                     baselines['Uniform'] = float(l.split('|')[3])
 
-                if "ORACLE " in l:
+                if re.match(r"^ORACLE\s+\|", l):
                     baselines['Oracle'] = float(l.split('|')[3])
 
                 if "RATIOS:" in l:
@@ -172,6 +172,29 @@ def generate_extensive_visuals(df):
     plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', title="Algorithm")
     plt.tight_layout()
     plt.savefig(os.path.join(OUTPUT_DIR, "1_All_Permutations_Scatter.png"), dpi=300)
+    plt.close()
+
+    # --- NEW: Scatter מול ORACLE ---
+    plt.figure(figsize=(14, 10))
+
+    ax = sns.scatterplot(
+        data=df_best_backend,
+        x='sqrt_JSD',
+        y='Oracle_Gap',
+        hue='Algorithm',
+        hue_order=allowed_algos,
+        alpha=0.7,
+        s=100,
+        palette='viridis'
+    )
+
+    plt.axhline(0, color='red', linestyle='--', linewidth=2, label='ORACLE')
+    plt.title("All Permutations: Accuracy Gap to ORACLE vs. $\sqrt{JSD}$", fontsize=20)
+    plt.xlabel("$\sqrt{JSD}$ (Distance)", fontsize=16)
+    plt.ylabel("Accuracy - ORACLE (%)", fontsize=16)
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', title="Algorithm")
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, "1B_All_Permutations_Scatter_OracleGap.png"), dpi=300)
     plt.close()
 
     # --- 1A. Scatter with error bars: best backend per point ---
@@ -341,7 +364,7 @@ def main():
         try:
             gmms = {d: joblib.load(os.path.join(cfg['MODELS_DIR'], f"gmm_{d}.pkl")) for d in cfg['DOMAINS']}
         except Exception as e:
-            print(f"Failed parsing block in {dataset_name}: {e}")
+            print(f"Failed processing {ds_name}: {e}")
             continue
 
         results = parse_detailed_results(cfg['RESULTS_FILE'], ds_name)
@@ -358,10 +381,10 @@ def main():
     if all_rows:
         df = pd.DataFrame(all_rows)
         df = df[df['Algorithm'].apply(lambda x: str(x).startswith('3.') or 'CVXPY' in str(x))].copy()
+        df['Oracle_Gap'] = df['Accuracy'] - df['Oracle']
         generate_extensive_visuals(df)
         df.to_csv(os.path.join(OUTPUT_DIR, "complete_permutations_data.csv"), index=False)
         print(f"✅ Success! Data saved in: {OUTPUT_DIR}")
-
 
 if __name__ == "__main__":
     main()

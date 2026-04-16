@@ -20,8 +20,10 @@ from torchvision import models, transforms, datasets
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 import traceback
-
+import pickle
+from datetime import datetime
 from dc import *
+from dc_fast import *
 from vae import *
 import data as Data
 import classifier as ClSFR
@@ -46,15 +48,36 @@ from helpers import *
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ["OMP_NUM_THREADS"] = "1"
 torch.set_num_threads(1)
 
+
+# TODO - CHANGED CONSTRAINT FOR 3.3... ONLY!!!!!!!!!!!!!
 # ==========================================
 # --- CONFIGURATION ---
 # ==========================================
-DATASET_MODE = "DOMAINNET"# "DIGITS"VX #"OFFICE224"VX #"OFFICE31"V
+DATASET_MODE = "DOMAINNET"# "DIGITS"VX #"OFFICE224"VX #"OFFICE31"V DOMAINNET
 USE_PRECOMPUTED_D = True
 USE_ARTIFICIAL_RATIOS = True
+
+FORBIDDEN_EXACT_PAIRS = {
+    tuple(sorted(['clipart', 'infograph'])), #V
+    tuple(sorted(['clipart', 'painting'])), #V
+    tuple(sorted(['clipart', 'quickdraw'])),#V
+    tuple(sorted(['clipart', 'real'])), #V
+    tuple(sorted(['clipart', 'sketch'])), #V
+    tuple(sorted(['infograph', 'painting'])), #V
+    tuple(sorted(['infograph', 'quickdraw'])), #V
+    tuple(sorted(['infograph', 'real'])), #V
+    tuple(sorted(['infograph', 'sketch'])), #V
+    tuple(sorted(['painting', 'quickdraw'])), #V
+    tuple(sorted(['painting', 'real'])), #V
+    tuple(sorted(['painting', 'sketch'])), #V
+    tuple(sorted(['quickdraw', 'real'])), #V
+    tuple(sorted(['quickdraw', 'sketch'])), #V
+    tuple(sorted(['real', 'sketch'])), #V
+
+}
 
 CONFIGS = {
     "DIGITS": {
@@ -65,36 +88,36 @@ CONFIGS = {
         "TEST_SET_SIZES": {'MNIST': 10000, 'USPS': 2007, 'SVHN': 26032},
         "D_PRECOMP_PATH":"/data/nogaz/Convex_bounds_optimization/LatentFlow_Pixel_Experiments/results/D_Matrix_FINAL_GMM_Soft_DIGITS.npy"
     },
-    "OFFICE": {  # for office-home after resizing by 0.5
-        "DOMAINS": ['Art', 'Clipart', 'Product', 'Real World'],
-        "CLASSES": 65,
-        "INPUT_DIM": 2048,
-        "SOURCE_ERRORS": {'Art': 0.11, 'Clipart': 0.08, 'Product': 0.03, 'Real World': 0.07},
-        "TEST_SET_SIZES": {'Art': 490, 'Clipart': 870, 'Product': 880, 'Real World': 870}
-    },
     "OFFICE224": {  # for office-home
         "DOMAINS": ['Art', 'Clipart', 'Product', 'Real World'],
         "CLASSES": 65,
         "INPUT_DIM": 2048,
-        "SOURCE_ERRORS": {'Art': 0.0535, 'Clipart': 0.0435, 'Product': 0.0169, 'Real World': 0.0310},
-        "TEST_SET_SIZES": {'Art': 486, 'Clipart': 873, 'Product': 888, 'Real World': 870},
+        "SOURCE_ERRORS": {'Art': 0.0139, 'Clipart': 0.06943, 'Product': 0.00383, 'Real World': 0.04968},
+        "SOURCE_LOSSES": {'Art': 0.05358, 'Clipart': 0.22513, 'Product': 0.01883, 'Real World': 0.132},
+        "TEST_SET_SIZES": {'Art': 486, 'Clipart': 873, 'Product': 888, 'Real World': 872},
         "D_PRECOMP_PATH":"/data/nogaz/Convex_bounds_optimization/LatentFlow_Pixel_Experiments/results/D_Matrix_FINAL_GMM_Soft_OfficeHome.npy"
     },
     "OFFICE31": {
         "DOMAINS": ['amazon', 'dslr', 'webcam'],
         "CLASSES": 31,
         "INPUT_DIM": 2048,
-        "SOURCE_ERRORS": {'amazon': 0.1352, 'dslr': 0.0178, 'webcam': 0.0225},
-        "TEST_SET_SIZES": {'amazon': 563, 'dslr': 100, 'webcam': 159},
+        "SOURCE_ERRORS": {'amazon': 0.02855, 'dslr': 1e-05, 'webcam': 0.00018},
+        "SOURCE_LOSSES": {'amazon': 0.07293, 'dslr': 0.13897, 'webcam': 0.02134},
+        "TEST_SET_SIZES": {'amazon': 564, 'dslr': 100, 'webcam': 159},
         "D_PRECOMP_PATH":"/data/nogaz/Convex_bounds_optimization/LatentFlow_Pixel_Experiments/results/D_Matrix_FINAL_GMM_Soft.npy"
     },
     "DOMAINNET": {
         "DOMAINS": ["clipart", "infograph", "painting", "quickdraw", "real", "sketch"],
         "CLASSES": 345,
         "INPUT_DIM": 2048,
-        "SOURCE_ERRORS": {'clipart': 0.0637, 'infograph': 0.1523, 'painting': 0.0656, 'quickdraw': 0.1512, 'real': 0.0382, 'sketch': 0.0796},
-        "TEST_SET_SIZES": {'clipart': 9767, 'infograph': 10641, 'painting': 15152, 'quickdraw': 34500, 'real': 35066, 'sketch': 14078},
-        "D_PRECOMP_PATH": "/data/nogaz/Convex_bounds_optimization/LatentFlow_Pixel_Experiments/results/D_Matrix_Optimized_DomainNet.npy"
+        # "SOURCE_ERRORS": {'clipart': 0.0637, 'infograph': 0.1523, 'painting': 0.0656, 'quickdraw': 0.1512, 'real': 0.0382, 'sketch': 0.0796},
+        "SOURCE_ERRORS": {'clipart': 0.41511, 'infograph': 0.78587, 'painting': 0.32533, 'quickdraw': 0.30616,
+                          'real': 0.13799, 'sketch': 0.37851},
+        "SOURCE_LOSSES": {'clipart': 2.30216, 'infograph': 5.11777, 'painting': 1.90294, 'quickdraw': 1.26597,
+                          'real': 0.77012, 'sketch': 2.13864},
+
+        "TEST_SET_SIZES": {'clipart': 14604, 'infograph': 15582, 'painting': 21850, 'quickdraw': 51750, 'real': 52041, 'sketch': 20916},
+        "D_PRECOMP_PATH": "/data/nogaz/Convex_bounds_optimization/LatentFlow_Pixel_Experiments/results/D_Matrix_Optimized_DomainNet_ALL.npy"
     }
 }
 
@@ -249,15 +272,13 @@ class FeatureExtractor(nn.Module):
         return feats, self.head(feats)
 
 
-# ============================================================
-# --- NEW: Precomputed D support utilities (OfficeHome/Office31)
-# ============================================================
 def compute_domain_lengths(domains):
     """
     Computes the TOTAL number of samples (Train + Test) in each domain.
     Needed for correctly slicing the Global_D matrix.
     """
     lengths = {}
+
     for d in domains:
         if DATASET_MODE == 'DIGITS':
             try:
@@ -268,12 +289,28 @@ def compute_domain_lengths(domains):
                     lengths[d] = l_train + l_test
                 else:
                     lengths[d] = len(ret.dataset)
-
             except Exception as e:
                 print(f"Error computing length for {d}: {e}")
                 lengths[d] = 0
+
+        elif DATASET_MODE == "DOMAINNET":
+            train_file = os.path.join(Data.DOMAINNET_PATH, f"{d}_train.txt")
+            test_file = os.path.join(Data.DOMAINNET_PATH, f"{d}_test.txt")
+
+            train_ds = Data.DomainNetSplitDataset(
+                root=Data.DOMAINNET_PATH,
+                split_file=train_file,
+                transform=None
+            )
+            test_ds = Data.DomainNetSplitDataset(
+                root=Data.DOMAINNET_PATH,
+                split_file=test_file,
+                transform=None
+            )
+
+            lengths[d] = len(train_ds) + len(test_ds)
+
         else:
-            # OFFICE logic
             path = get_domain_path(d)
             if os.path.exists(path):
                 ds = datasets.ImageFolder(path)
@@ -322,57 +359,107 @@ class TransformedSubset(torch.utils.data.Dataset):
         return len(self.subset)
 
 
+def make_rgb_transforms(target_size=224):
+    train_trans = transforms.Compose([
+        transforms.Resize((target_size, target_size)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomRotation(10),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
+    ])
+
+    test_trans = transforms.Compose([
+        transforms.Resize((target_size, target_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
+    ])
+    return train_trans, test_trans
+
+
+def make_loader(dataset, batch_size, shuffle=False, num_workers=4, pin_memory=True):
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+
+
 def get_train_test_loaders_and_indices(domain: str, seed: int, batch_size=64, test_batch_size=64):
-    """
-    Matches the other file behavior:
-    - ImageFolder without transform
-    - permute indices with seed
-    - split 80/20
-    - build transformed Subset loaders
-    - return ordered loaders (shuffle=False) so D slicing aligns deterministically
-    """
     if DATASET_MODE == 'DIGITS':
         train_loader, test_loader, _ = Data.get_data_loaders(domain, seed=seed, batch_size=batch_size)
         n_train = len(train_loader.dataset)
         n_test = len(test_loader.dataset)
-        N_total = n_train + n_test
+        return (
+            train_loader,
+            test_loader,
+            np.arange(0, n_train),
+            np.arange(n_train, n_train + n_test),
+            n_train + n_test,
+        )
+
+    train_trans, test_trans = make_rgb_transforms(
+        Data.get_config(domain)["size"] if DATASET_MODE == "DOMAINNET" else 224
+    )
+
+    if DATASET_MODE == "DOMAINNET":
+        train_file = os.path.join(Data.DOMAINNET_PATH, f"{domain}_train.txt")
+        test_file = os.path.join(Data.DOMAINNET_PATH, f"{domain}_test.txt")
+
+        train_ds = Data.DomainNetSplitDataset(
+            root=Data.DOMAINNET_PATH,
+            split_file=train_file,
+            transform=train_trans
+        )
+        test_ds = Data.DomainNetSplitDataset(
+            root=Data.DOMAINNET_PATH,
+            split_file=test_file,
+            transform=test_trans
+        )
+
+        n_train = len(train_ds)
+        n_test = len(test_ds)
+
         train_idx = np.arange(0, n_train)
         test_idx = np.arange(n_train, n_train + n_test)
-        return train_loader, test_loader, train_idx, test_idx, N_total
 
-    path = get_domain_path(domain)
-    ds_full = datasets.ImageFolder(path)
+    else:
+        path = get_domain_path(domain)
+        ds_full = datasets.ImageFolder(path)
 
-    N = len(ds_full)
-    rng = np.random.RandomState(seed)
-    indices = rng.permutation(N)
-    split_point = int(0.8 * N)
-    train_idx = indices[:split_point]
-    test_idx = indices[split_point:]
+        N = len(ds_full)
+        rng = np.random.RandomState(seed)
+        indices = rng.permutation(N)
+        split_point = int(0.8 * N)
 
-    # Transforms (match your current pipeline)
-    tr_train = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomRotation(10),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-    tr_test = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+        train_idx = indices[:split_point]
+        test_idx = indices[split_point:]
 
-    train_ds = TransformedSubset(Subset(ds_full, train_idx), tr_train)
-    test_ds = TransformedSubset(Subset(ds_full, test_idx), tr_test)
+        train_ds = TransformedSubset(Subset(ds_full, train_idx), train_trans)
+        test_ds = TransformedSubset(Subset(ds_full, test_idx), test_trans)
 
-    # IMPORTANT: ordered loaders (shuffle=False) for alignment with sliced D
-    train_loader_ordered = DataLoader(train_ds, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
-    test_loader_ordered = DataLoader(test_ds, batch_size=test_batch_size, shuffle=False, num_workers=4, pin_memory=True)
+        n_train = len(train_ds)
+        n_test = len(test_ds)
 
-    return train_loader_ordered, test_loader_ordered, train_idx, test_idx, N
+    train_loader = make_loader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=Data.DATA_LOADER_WORKERS if DATASET_MODE == "DOMAINNET" else 4,
+        pin_memory=(Data.device.type == "cuda") if DATASET_MODE == "DOMAINNET" else True,
+    )
+    test_loader = make_loader(
+        test_ds,
+        batch_size=test_batch_size,
+        shuffle=False,
+        num_workers=Data.DATA_LOADER_WORKERS if DATASET_MODE == "DOMAINNET" else 4,
+        pin_memory=(Data.device.type == "cuda") if DATASET_MODE == "DOMAINNET" else True,
+    )
 
+    return train_loader, test_loader, train_idx, test_idx, n_train + n_test
 
 # ==========================================
 # --- Core matrix builder (KDE path) ---
@@ -470,9 +557,10 @@ def evaluate_accuracy_q(Q, H, Y):
 
 
 def run_baselines(Y, D, H, source_domains, target_domains, all_source_domains, seed, true_r_weights):
-    print(" [Baseline] Running Oracle and Uniform...")
+    print(" [Baseline] Running Oracle, Uniform, and Best Single Source...")
     buf = io.StringIO()
-    total = sum([TEST_SET_SIZES.get(d, 1) for d in target_domains])
+
+    # --- 1. Oracle & Uniform ---
     uniform_w = np.ones(len(source_domains)) / len(source_domains)
     for name, w in [("ORACLE", true_r_weights), ("UNIFORM", uniform_w)]:
         acc = evaluate_accuracy_wd(w, D, H, Y)
@@ -480,7 +568,33 @@ def run_baselines(Y, D, H, source_domains, target_domains, all_source_domains, s
         buf.write(f"{name:<18} | {'N/A':<15} | {'N/A':<15} | {acc:<12.2f} | {str(np.round(w_f, 4))}\n")
         print(f" >>> [Baseline] {name:<7} | Acc: {acc:.2f}%")
 
+    # --- 2. Best Single Source (New) ---
+    # H has shape (N, C, K). We check which k in range(K) gives the best accuracy.
     y_true = Y.argmax(axis=1)
+    best_single_acc = -1.0
+    best_source_name = ""
+    best_source_idx = -1
+
+    for k, src_name in enumerate(source_domains):
+        # Predict using only source k: H[:, :, k]
+        src_preds = H[:, :, k].argmax(axis=1)
+        src_acc = accuracy_score(y_true, src_preds) * 100.0
+
+        if src_acc > best_single_acc:
+            best_single_acc = src_acc
+            best_source_name = src_name
+            best_source_idx = k
+
+    # Create a one-hot weight vector for the best source for the output log
+    w_best_single = np.zeros(len(source_domains))
+    w_best_single[best_source_idx] = 1.0
+    w_f_best = map_weights_to_full_source_list(w_best_single, source_domains, all_source_domains)
+
+    buf.write(
+        f"{'BEST_SINGLE_SRC':<18} | {best_source_name:<15} | {'N/A':<15} | {best_single_acc:<12.2f} | {str(np.round(w_f_best, 4))}\n")
+    print(f" >>> [Baseline] BEST_SINGLE_SRC ({best_source_name}) | Acc: {best_single_acc:.2f}%")
+
+    # --- 3. Oracle Any Correct ---
     pred_per_source = H.argmax(axis=1)  # (N, K)
     any_correct = (pred_per_source == y_true[:, None]).any(axis=1)
     oracle_any_acc = any_correct.mean() * 100.0
@@ -488,12 +602,13 @@ def run_baselines(Y, D, H, source_domains, target_domains, all_source_domains, s
     buf.write(f"{'ORACLE_ANY_CORRECT':<18} | {'N/A':<15} | {'N/A':<15} | {oracle_any_acc:<12.2f} | N/A\n")
     print(f" >>> [Baseline] ORACLE_ANY_CORRECT | Acc: {oracle_any_acc:.2f}%")
 
+    # --- 4. DC Solver ---
     print(" [Baseline] Running DC Solver...")
     dc_accuracies, best_z_dc = [], None
     for i in range(5):
         try:
-            dp = init_problem_from_model(Y, D, H, p=len(source_domains), C=NUM_CLASSES)
-            slv = ConvexConcaveSolver(ConvexConcaveProblem(dp), seed + (i * 100), "err")
+            dp = init_problem_from_model_fast(Y, D, H, p=len(source_domains), C=NUM_CLASSES)
+            slv = ConvexConcaveSolverFast(ConvexConcaveProblemFast(dp), seed + (i * 100), "err")
             z_dc, _, _ = slv.solve()
             if z_dc is not None:
                 acc = evaluate_accuracy_wd(z_dc, D, H, Y)
@@ -506,23 +621,27 @@ def run_baselines(Y, D, H, source_domains, target_domains, all_source_domains, s
         avg_res = f"{np.mean(dc_accuracies):.2f}±{np.std(dc_accuracies):.2f}"
         w_f = map_weights_to_full_source_list(best_z_dc, source_domains, all_source_domains)
         buf.write(f"{'DC (5-Seeds)':<18} | {'N/A':<15} | {'N/A':<15} | {avg_res:<12} | {str(np.round(w_f, 4))}\n")
+
     return buf.getvalue()
+
 
 # from cvxpy_3_21 import solve_convex_problem_smoothed_kl_321
 # from cvxpy_3_22 import solve_convex_problem_domain_anchored_smoothed
 # from cvxpy_3_23 import solve_convex_problem_smoothed_original_p
 
 
-def run_solver_sweep_worker(Y, D, H, eps_mult, source_domains, all_source_domains):
+def run_solver_sweep_worker(Y, D, H, eps_mult, source_domains, all_source_domains, save_dir,
+    strategy_name=None, target_domains=None, true_r_weights=None,
+):
     print(f" [Worker] Starting sweep for Epsilon Mult: {eps_mult}")
     buf = io.StringIO()
 
     errors = np.array([(SOURCE_ERRORS.get(d, 0.1) + 0.05) * eps_mult for d in source_domains])
     max_ent = np.log(len(source_domains)) if len(source_domains) > 1 else 0.1
 
-    SOLVERS = ["3.21", "3.22", "3.23", "CVXPY_GLOBAL", "3.31", "3.32", "3.33"]
-    BACKENDS = ["SCS", "MOSEK"]   # <- run both
-    DELTA_MULTS = [1.0, 1.2]
+    SOLVERS = ["3.31", "3.33"] # "3.32", "3.21", "3.22", "3.23", "CVXPY_GLOBAL",
+    BACKENDS = ["SCS"]# , "MOSEK"]   # <- run both
+    DELTA_MULTS = [1.2]#, 1.2]
 
     for solver in SOLVERS:
         for mult in DELTA_MULTS:
@@ -589,6 +708,19 @@ def run_solver_sweep_worker(Y, D, H, eps_mult, source_domains, all_source_domain
                         buf.write(f"[{solver}/{backend}] Returned None (likely infeasible)\n")
                         continue
 
+                    save_qstar_artifact(
+                        base_dir=save_dir, Q=Q, w=w, Y=Y,
+                        source_domains=source_domains,
+                        all_source_domains=all_source_domains, solver=solver, backend=backend, eps_mult=eps_mult,
+                        delta_mult=mult, dataset_mode=DATASET_MODE, strategy_name=strategy_name,
+                        target_domains=target_domains if target_domains is not None else source_domains,
+                        true_r_weights=true_r_weights,
+                        extra_info={
+                            "errors": errors.tolist(),
+                            "max_entropy": float(max_ent),
+                            "epsilon_used": float(np.max(errors)),
+                        },
+                    )
                     # ----------------------------
                     # evaluate (same code path!)
                     # ----------------------------
@@ -686,8 +818,7 @@ def apply_custom_ratios(Y, D, H, target_domains, custom_ratios_dict):
     requested_ratios = [custom_ratios_dict[d] for d in target_domains]
 
     max_total_N = int(min([actual / ratio for actual, ratio in zip(current_sizes, requested_ratios)]))
-    # הוספת התקרה כדי למנוע קריסת RAM - היחסים נשמרים!
-    max_total_N = min(max_total_N, 15000)
+    max_total_N = min(max_total_N, 10000)
     new_indices = []
     offset = 0
     for i, dom in enumerate(target_domains):
@@ -707,6 +838,9 @@ def task_run(classifiers, all_source_domains):
     test_path = f'./results_{DATASET_MODE}_mosek/seed_{seed}/'
     os.makedirs(test_path, exist_ok=True)
 
+    qstar_save_dir = os.path.join(test_path, "saved_qstars")
+    os.makedirs(qstar_save_dir, exist_ok=True)
+
     if USE_PRECOMPUTED_D is False:
         models, normalize_factors, vae_norm_stats = handle_vae_models(all_source_domains, classifiers, seed)
 
@@ -717,13 +851,17 @@ def task_run(classifiers, all_source_domains):
         if Global_D is not None:
             domain_lengths = compute_domain_lengths(all_source_domains)
 
-    filename = f'Sweep_Results_{seed}_3_sets_with_config.txt'
+    filename = f'Sweep_Results_{seed}_3_sets_all_baselines_new_constr.txt'
 
     with open(os.path.join(test_path, filename), 'a') as fp:
         for target in [list(s) for r in range(2, len(all_source_domains) + 1) for s in
                        itertools.combinations(all_source_domains, r)]:
 
             target_tuple = tuple(sorted(target))
+
+            if target_tuple in FORBIDDEN_EXACT_PAIRS:
+                print(f"⏭️ Skipping exact forbidden pair: {target}")
+                continue
 
             if target_tuple not in TARGET_RATIOS_CONFIG:
                 print(f"⚠️ Skipping {target} - not in TARGET_RATIOS_CONFIG")
@@ -777,9 +915,20 @@ def task_run(classifiers, all_source_domains):
 
                 fp.write(run_baselines(Y, D, H, target, target, all_source_domains, seed, true_r_weights))
 
-                results = Parallel(n_jobs=1, verbose=5)(
-                    delayed(run_solver_sweep_worker)(Y, D, H, e, target, all_source_domains)
-                    for e in [1.0, 1.1, 2.0]
+                results = Parallel(n_jobs=2, verbose=5)(
+                    delayed(run_solver_sweep_worker)(
+                        Y,
+                        D,
+                        H,
+                        e,
+                        target,
+                        all_source_domains,
+                        qstar_save_dir,
+                        strategy_name=strategy_name,
+                        target_domains=target,
+                        true_r_weights=true_r_weights,
+                    )
+                    for e in [1.0, 2.0]
                 )
                 for r in results: fp.write(r)
                 fp.flush()
@@ -827,6 +976,28 @@ def handle_vae_models(all_source_domains, classifiers, seed):
         normalize_factors[d] = (lp.mean(), lp.std())
         print(f"✅ Loaded VRS for {d}")
     return models, normalize_factors, vae_norm_stats
+
+def get_actual_test_set_sizes(domains):
+    """
+    Iterates through the DomainNet test split files and counts the
+    actual number of samples to fill the TEST_SET_SIZES dictionary.
+    """
+    actual_sizes = {}
+    print("--> Calculating actual test set sizes for DomainNet...")
+    for d in domains:
+        test_file = os.path.join(Data.DOMAINNET_PATH, f"{d}_test.txt")
+        if os.path.exists(test_file):
+            # We initialize the dataset without transforms to speed up the count
+            test_ds = Data.DomainNetSplitDataset(
+                root=Data.DOMAINNET_PATH,
+                split_file=test_file,
+                transform=None
+            )
+            actual_sizes[d] = len(test_ds)
+        else:
+            print(f"  [WARNING] Test file not found for {d}: {test_file}")
+            actual_sizes[d] = 0
+    return actual_sizes
 
 
 def main():

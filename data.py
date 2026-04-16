@@ -5,6 +5,7 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 import os
 from collections import defaultdict
+from PIL import Image
 
 # --- Global Configuration ---
 
@@ -41,7 +42,8 @@ DOMAIN_CONFIGS = {
 }
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+TOTAL_CPUS = os.cpu_count() or 1
+DATA_LOADER_WORKERS = 0 # min(8, max(2, TOTAL_CPUS // 4))
 
 # --- Helper Classes ---
 
@@ -91,9 +93,15 @@ class MyDataset(Dataset):
 
 def generate_data_loader(X, Y, transform=None, shuffle=True, batch_size=128):
     dataset = MyDataset(X[:, None, :, :], Y, transform)
-    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=DATA_LOADER_WORKERS,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=(DATA_LOADER_WORKERS > 0)
+    )
     return loader
-
 
 def prep_pixels(images):
     images_norm = images.astype('float32')
@@ -152,30 +160,78 @@ def get_office31_split(dataset, domain_name, seed=None):
 
 
 # --- Data Loading Logic ---
+class DomainNetSplitDataset(Dataset):
+    def __init__(self, root, split_file, transform=None):
+        self.root = root
+        self.transform = transform
+        self.samples = []
+
+        with open(split_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+
+                rel_path, label = line.rsplit(' ', 1)
+                rel_path = rel_path.replace('/', os.sep).replace('\\', os.sep)
+                full_path = os.path.join(root, rel_path)
+
+                self.samples.append((full_path, int(label)))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        img_path, label = self.samples[idx]
+        image = Image.open(img_path).convert('RGB')
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, label
+
 
 def get_dataset(data_name, trans):
     if data_name in OFFICE_HOME_DOMAINS:
         full_path = os.path.join(OFFICE_HOME_PATH, data_name)
         dataset = datasets.ImageFolder(root=full_path, transform=trans)
         return dataset, None
+
     elif data_name in DOMAINNET_DOMAINS:
-        full_path = os.path.join(DOMAINNET_PATH, data_name)
-        dataset = datasets.ImageFolder(root=full_path, transform=trans)
-        return dataset, None
+        train_file = os.path.join(DOMAINNET_PATH, f"{data_name}_train.txt")
+        test_file = os.path.join(DOMAINNET_PATH, f"{data_name}_test.txt")
+
+        train_dataset = DomainNetSplitDataset(
+            root=DOMAINNET_PATH,
+            split_file=train_file,
+            transform=trans
+        )
+        test_dataset = DomainNetSplitDataset(
+            root=DOMAINNET_PATH,
+            split_file=test_file,
+            transform=trans
+        )
+        return train_dataset, test_dataset
+
     elif data_name in OFFICE_31_DOMAINS:
         full_path = os.path.join(OFFICE_31_PATH, data_name)
         dataset = datasets.ImageFolder(root=full_path, transform=trans)
         return dataset, None
+
     elif data_name == 'MNIST':
         return datasets.MNIST('data_MNIST', train=True, download=True, transform=trans), \
             datasets.MNIST('data_MNIST', train=False, transform=trans)
+
     elif data_name == 'SVHN':
         return datasets.SVHN('data_SVHN', split='train', transform=trans, download=True), \
             datasets.SVHN('data_SVHN', split='test', transform=trans, download=True)
+
     elif data_name == 'USPS':
         return datasets.USPS('data_USPS', train=True, transform=trans, download=True), \
             datasets.USPS('data_USPS', train=False, transform=trans, download=True)
+
     return None, None
+
 
 
 def get_labels(data_name, dataset):
@@ -207,20 +263,48 @@ def get_data_loaders(data_name, seed=None, num_datapoints=None, batch_size=128, 
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
+    # --- DomainNet: use official split files ---
+    if data_name in DOMAINNET_DOMAINS:
+        train_dataset, _ = get_dataset(data_name, train_trans)
+        _, test_dataset = get_dataset(data_name, test_trans)
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=DATA_LOADER_WORKERS,
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=(DATA_LOADER_WORKERS > 0)
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=test_batch_size,
+            shuffle=False,
+            num_workers=DATA_LOADER_WORKERS,
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=(DATA_LOADER_WORKERS > 0)
+        )
+        return train_loader, test_loader, config
+
     # --- 2. Load Data ---
     # Load dataset without fixed transform first (passed as None) to handle splits manually
     raw_train, raw_test = get_dataset(data_name, None)
 
     # Case A: Office Datasets (RGB with Augmentation)
-    if (data_name in OFFICE_HOME_DOMAINS) or (data_name in OFFICE_31_DOMAINS) or (data_name in DOMAINNET_DOMAINS):
+    if (data_name in OFFICE_HOME_DOMAINS) or (data_name in OFFICE_31_DOMAINS):
         dataset = raw_train
+
         if data_name in OFFICE_31_DOMAINS:
             train_subset, test_subset = get_office31_split(dataset, data_name, seed)
         else:
             total_len = len(dataset)
             train_len = int(0.8 * total_len)
             generator = torch.Generator().manual_seed(seed) if seed else None
-            train_subset, test_subset = random_split(dataset, [train_len, total_len - train_len], generator=generator)
+            train_subset, test_subset = random_split(
+                dataset,
+                [train_len, total_len - train_len],
+                generator=generator
+            )
 
         # Apply different transforms to Train and Test loaders
         train_loader = DataLoader(ApplyTransform(train_subset, train_trans), batch_size=batch_size, shuffle=True)

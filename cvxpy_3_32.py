@@ -122,22 +122,39 @@ def solve_convex_problem_domain_anchored_smoothed_332(
     ]
 
     # -------------------------
-    # NEW epsilon constraints
+    # OLD epsilon constraints
     #   S_j := sum_i D_{ij} Q_{ij}
     #   For each t: S^T (L_mat[:,t] - eps_t) <= 0
     # -------------------------
-    S = cp.sum(cp.multiply(D, Q), axis=0)  # shape (k,)
+    # S = cp.sum(cp.multiply(D, Q), axis=0)  # shape (k,)
+    #
+    # if isinstance(epsilon, (list, tuple, np.ndarray)):
+    #     eps_vec = np.asarray(epsilon).reshape(-1)
+    #     if eps_vec.shape[0] != k:
+    #         raise ValueError(f"epsilon vector must have length k={k}. Got {eps_vec.shape[0]}")
+    #     for t in range(k):
+    #         constraints.append(S @ (L_mat[:, t] - eps_vec[t]) <= 0)
+    # else:
+    #     eps_val = float(epsilon)
+    #     for t in range(k):
+    #         constraints.append(S @ (L_mat[:, t] - eps_val) <= 0)
+
+    # --------------------------------------------------------
+    # NEW epsilon constraints
+    # --------------------------------------------------------
 
     if isinstance(epsilon, (list, tuple, np.ndarray)):
         eps_vec = np.asarray(epsilon).reshape(-1)
         if eps_vec.shape[0] != k:
             raise ValueError(f"epsilon vector must have length k={k}. Got {eps_vec.shape[0]}")
         for t in range(k):
-            constraints.append(S @ (L_mat[:, t] - eps_vec[t]) <= 0)
+            S_t = cp.sum(cp.multiply(D[:, t:t + 1], Q), axis=0)  # shape (k,)
+            constraints.append(S_t @ (L_mat[:, t] - eps_vec[t]) <= 0)
     else:
         eps_val = float(epsilon)
         for t in range(k):
-            constraints.append(S @ (L_mat[:, t] - eps_val) <= 0)
+            S_t = cp.sum(cp.multiply(D[:, t:t + 1], Q), axis=0)  # shape (k,)
+            constraints.append(S_t @ (L_mat[:, t] - eps_val) <= 0)
 
     # -------------------------
     # Solve
@@ -194,20 +211,33 @@ def solve_convex_problem_domain_anchored_smoothed_332(
         f"min entry = {Q_val.min():.2e}"
     )
 
-    # Diagnostics for the NEW constraint:
+    # Diagnostics for the OLD constraint:
     # For each t, compute S^T (L[:,t] - eps_t) which should be <= 0.
-    S_val = np.sum(D * Q_val, axis=0)  # (k,)
+    # S_val = np.sum(D * Q_val, axis=0)  # (k,)
+    #
+    # if isinstance(epsilon, (list, tuple, np.ndarray)):
+    #     eps_vec = np.asarray(epsilon).reshape(-1)
+    #     for t in range(k):
+    #         lhs = float(S_val @ (L_mat[:, t] - eps_vec[t]))
+    #         print(f"  • [Problem (3.32)] constraint(t={t}): S·(L[:,t]-eps_t) = {lhs:.4e} (<= 0)")
+    # else:
+    #     eps_val = float(epsilon)
+    #     for t in range(k):
+    #         lhs = float(S_val @ (L_mat[:, t] - eps_val))
+    #         print(f"  • [Problem (3.32)] constraint(t={t}): S·(L[:,t]-eps) = {lhs:.4e} (<= 0)")
 
     if isinstance(epsilon, (list, tuple, np.ndarray)):
         eps_vec = np.asarray(epsilon).reshape(-1)
         for t in range(k):
-            lhs = float(S_val @ (L_mat[:, t] - eps_vec[t]))
-            print(f"  • [Problem (3.32)] constraint(t={t}): S·(L[:,t]-eps_t) = {lhs:.4e} (<= 0)")
+            S_t_val = np.sum(Q_val * D[:, t:t + 1], axis=0)
+            lhs = float(S_t_val @ (L_mat[:, t] - eps_vec[t]))
+            print(f"  • [Problem (3.32)] constraint(t={t}): S_t·(L[:,t]-eps_t) = {lhs:.4e} (<= 0)")
     else:
         eps_val = float(epsilon)
         for t in range(k):
-            lhs = float(S_val @ (L_mat[:, t] - eps_val))
-            print(f"  • [Problem (3.32)] constraint(t={t}): S·(L[:,t]-eps) = {lhs:.4e} (<= 0)")
+            S_t_val = np.sum(Q_val * D[:, t:t + 1], axis=0)
+            lhs = float(S_t_val @ (L_mat[:, t] - eps_val))
+            print(f"  • [Problem (3.32)] constraint(t={t}): S_t·(L[:,t]-eps) = {lhs:.4e} (<= 0)")
 
     return w_val, Q_val
 

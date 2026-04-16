@@ -5,10 +5,10 @@ import json
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
 from scipy.stats import spearmanr
+from matplotlib.colors import TwoSlopeNorm
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, Subset
 
@@ -26,6 +26,10 @@ BATCH_SIZE = 64
 TEST_BATCH_SIZE = 64
 RESULTS_DIR = "./correlation_matrices_results"
 CLASSIFIERS_DIR = "./classifiers"
+
+HEATMAP_VMIN = -0.5
+HEATMAP_VMAX = 0.5
+HEATMAP_CENTER = 0.0
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Running on: {device}")
@@ -245,7 +249,7 @@ def load_source_models(domains):
 
 
 # ============================================================
-# LOSS / ERROR COLLECTION
+# ERROR COLLECTION
 # ============================================================
 
 def collect_metrics_for_target(dataset_mode, target_domain, domains, source_models):
@@ -259,7 +263,6 @@ def collect_metrics_for_target(dataset_mode, target_domain, domains, source_mode
         test_batch_size=TEST_BATCH_SIZE,
     )
 
-    ce_by_source = {src: [] for src in domains}
     err01_by_source = {src: [] for src in domains}
 
     for batch_i, (data, labels) in enumerate(test_loader):
@@ -269,33 +272,26 @@ def collect_metrics_for_target(dataset_mode, target_domain, domains, source_mode
         with torch.no_grad():
             for src in domains:
                 _, logits = source_models[src](data)
-
-                ce = F.cross_entropy(logits, labels, reduction="none")
                 preds = torch.argmax(logits, dim=1)
                 err01 = (preds != labels).float()
-
-                ce_by_source[src].append(ce.detach().cpu().numpy())
                 err01_by_source[src].append(err01.detach().cpu().numpy())
 
         if batch_i % 20 == 0:
             print(f"  target={target_domain}: batch {batch_i}/{len(test_loader)}", end="\r")
 
     for src in domains:
-        ce_by_source[src] = np.concatenate(ce_by_source[src], axis=0)
         err01_by_source[src] = np.concatenate(err01_by_source[src], axis=0)
 
     print(f"\nFinished target={target_domain}. N_test={len(test_idx)}")
-    return ce_by_source, err01_by_source, test_idx
+    return err01_by_source, test_idx
 
 
 # ============================================================
 # CORRELATION LOGIC
 # ============================================================
 
-def compute_all_correlations(score_vec, ce_vec, err01_vec):
+def compute_all_correlations(score_vec, err01_vec):
     return {
-        "pearson_ce": safe_pearsonr(score_vec, ce_vec),
-        "spearman_ce": safe_spearmanr(score_vec, ce_vec),
         "pearson_err01": safe_pearsonr(score_vec, err01_vec),
         "spearman_err01": safe_spearmanr(score_vec, err01_vec),
     }
@@ -303,8 +299,6 @@ def compute_all_correlations(score_vec, ce_vec, err01_vec):
 
 def init_result_matrices(domains):
     keys = [
-        "pearson_ce",
-        "spearman_ce",
         "pearson_err01",
         "spearman_err01",
     ]
@@ -325,7 +319,9 @@ def save_one_matrix(matrix, domains, dataset_mode, score_type, metric_name, save
     np.save(npy_path, matrix)
 
     fig, ax = plt.subplots(figsize=(1.8 * len(domains) + 2, 1.6 * len(domains) + 2))
-    im = ax.imshow(matrix, aspect="auto", vmin=-1, vmax=1)
+
+    norm = TwoSlopeNorm(vmin=HEATMAP_VMIN, vcenter=HEATMAP_CENTER, vmax=HEATMAP_VMAX)
+    im = ax.imshow(matrix, aspect="auto", cmap="bwr", norm=norm)
 
     ax.set_xticks(np.arange(len(domains)))
     ax.set_yticks(np.arange(len(domains)))
@@ -357,22 +353,27 @@ def save_metadata(dataset_mode, domains, save_dir):
         "score_types": {
             "col_score": (
                 "Original D as saved in the soft-GMM pipeline. "
-                "Columns are normalized to sum to 1, so this is a source-wise normalized density score across samples."
+                "Columns are normalized to sum to 1, so each source column is normalized separately."
             ),
             "row_score": (
                 "Row-normalized version of D over active sources. "
-                "Rows sum to 1, so this is the relative ownership / posterior-like score of sources for each sample."
+                "Rows sum to 1, so each sample gets a relative score over sources."
             ),
         },
         "metrics": {
-            "pearson_ce": "Pearson correlation between score and per-sample cross-entropy loss",
-            "spearman_ce": "Spearman correlation between score and per-sample cross-entropy loss",
             "pearson_err01": "Pearson correlation between score and per-sample 0/1 error",
             "spearman_err01": "Spearman correlation between score and per-sample 0/1 error",
         },
+        "heatmap": {
+            "cmap": "bwr",
+            "vmin": HEATMAP_VMIN,
+            "vcenter": HEATMAP_CENTER,
+            "vmax": HEATMAP_VMAX,
+            "meaning": "negative=blue, zero=white, positive=red",
+        },
         "interpretation": (
             "More negative values mean that when a source gives a sample a higher score, "
-            "that source tends to make smaller error on that sample."
+            "that source tends to make fewer 0/1 mistakes on that sample."
         ),
     }
 
@@ -416,7 +417,7 @@ def build_correlation_outputs_for_dataset(dataset_mode):
     }
 
     for target_j, target_domain in enumerate(domains):
-        ce_by_source, err01_by_source, test_idx = collect_metrics_for_target(
+        err01_by_source, test_idx = collect_metrics_for_target(
             dataset_mode=dataset_mode,
             target_domain=target_domain,
             domains=domains,
@@ -434,7 +435,6 @@ def build_correlation_outputs_for_dataset(dataset_mode):
         D_test_row = row_normalize_scores(D_test_col)
 
         for source_i, src in enumerate(domains):
-            ce_vec = ce_by_source[src]
             err01_vec = err01_by_source[src]
 
             score_variants = {
@@ -443,15 +443,15 @@ def build_correlation_outputs_for_dataset(dataset_mode):
             }
 
             for score_type, score_vec in score_variants.items():
-                out = compute_all_correlations(score_vec, ce_vec, err01_vec)
+                out = compute_all_correlations(score_vec, err01_vec)
 
                 for metric_name, val in out.items():
                     results[score_type][metric_name][source_i, target_j] = val
 
                 print(
                     f"  [{score_type}] source={src:<12} target={target_domain:<12} "
-                    f"pearson_ce={out['pearson_ce']:.4f} "
-                    f"pearson_err01={out['pearson_err01']:.4f}"
+                    f"pearson_err01={out['pearson_err01']:.4f} "
+                    f"spearman_err01={out['spearman_err01']:.4f}"
                 )
 
     save_dir = os.path.join(RESULTS_DIR, dataset_mode)

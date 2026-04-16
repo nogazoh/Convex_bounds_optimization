@@ -19,6 +19,8 @@ import itertools
 from torchvision import models, transforms, datasets
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
+import pickle
+from datetime import datetime
 
 
 def load_global_D_matrix(path: str):
@@ -59,3 +61,70 @@ def map_weights_to_full_source_list(subset_weights, subset_sources, full_source_
             if source in subset_sources:
                 full_weights[i] = subset_weights[subset_sources.index(source)]
     return full_weights
+
+def save_qstar_artifact(
+    base_dir,
+    Q,
+    w,
+    Y,
+    source_domains,
+    all_source_domains,
+    solver,
+    backend,
+    eps_mult,
+    delta_mult,
+    dataset_mode,
+    strategy_name=None,
+    target_domains=None,
+    true_r_weights=None,
+    extra_info=None,
+):
+    """
+    Save Q* and useful metadata for later analysis.
+    """
+    os.makedirs(base_dir, exist_ok=True)
+
+    source_domains = list(source_domains)
+    all_source_domains = list(all_source_domains)
+    target_domains = list(target_domains) if target_domains is not None else list(source_domains)
+
+    safe_target = "_".join(target_domains)
+    safe_solver = str(solver).replace("/", "_")
+    safe_backend = str(backend).replace("/", "_")
+    safe_strategy = "NA" if strategy_name is None else str(strategy_name).replace(" ", "_")
+
+    filename = (
+        f"qstar_{dataset_mode}"
+        f"__target_{safe_target}"
+        f"__strategy_{safe_strategy}"
+        f"__solver_{safe_solver}"
+        f"__backend_{safe_backend}"
+        f"__epsmult_{eps_mult}"
+        f"__deltamult_{delta_mult}.pkl"
+    )
+    save_path = os.path.join(base_dir, filename)
+
+    artifact = {
+        "timestamp": datetime.now().isoformat(),
+        "dataset_mode": dataset_mode,
+        "solver": solver,
+        "backend": backend,
+        "eps_mult": eps_mult,
+        "delta_mult": delta_mult,
+        "strategy_name": strategy_name,
+        "source_domains": source_domains,
+        "target_domains": target_domains,
+        "all_source_domains": all_source_domains,
+        "Q": np.asarray(Q),
+        "Q_shape": np.asarray(Q).shape,
+        "w": np.asarray(w),
+        "y_true": np.asarray(Y).argmax(axis=1),
+        "true_r_weights": None if true_r_weights is None else np.asarray(true_r_weights),
+        "extra_info": extra_info,
+    }
+
+    with open(save_path, "wb") as f:
+        pickle.dump(artifact, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    print(f"💾 Saved q* artifact to: {save_path}")
+    return save_path
