@@ -5,25 +5,25 @@ import numpy as np
 
 class init_problem_from_model_fast:
     def __init__(self, y, D, h, p=3, C=10):
-        self.y = y
-        self.n = len(y)
+        self.y = np.array(y, copy=True)
+        self.n = len(self.y)
 
         self.p = p  # number of domains
         self.C = C  # number of classes
         self.U = 1.0 / self.n  # unif dist
         self.eta = 0.01
 
-        self.D = D
-        self.h = h
+        self.D = np.array(D, dtype=float, copy=True)
+        self.h = np.array(h, copy=True)
 
         # Calculate the upper bound.
         self.load_M_fast()
 
         # compute H
-        self.H = (1.0 / self.p) * h.sum(axis=1)
+        self.H = (1.0 / self.p) * self.h.sum(axis=1)
 
         self.verify_D_fast()
-
+        
     def verify_D_fast(self):
         denom = np.sum(self.D, axis=tuple(range(self.D.ndim - 1)), keepdims=True)
         self.D[...] = self.D / denom

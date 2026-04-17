@@ -1,6 +1,6 @@
 import cvxpy as cp
 import numpy as np
-from cvxpy_solver import calculate_expected_loss
+from loss_functions import calculate_weighted_constraint_matrix
 
 
 # ============================================================
@@ -10,15 +10,22 @@ def _flatten_if_needed(Y, D, H):
     """
     Supports either:
       - D: (N, k), H: (N, k), Y: (N,)
-    or
       - D: (N0, C, k), H: (N0, C, k), Y: (N0, C)
-    Returns flattened (Y, D, H) and (N, k).
+
+    Returns flattened/reduced (Y, D, H) and (N, k).
+
+    Notes:
+    - If D,H,Y are in the class-expanded format (N0,C,k)/(N0,C),
+      we reduce D to (N0,k) and keep Y,H in their original shapes,
+      because the loss function in loss_functions.py already knows
+      how to handle Y:(N,C), H:(N,C,K), D:(N,K).
     """
     if D.ndim == 3:
-        _, _, k = D.shape
-        D = D.reshape(-1, k)
-        H = H.reshape(-1, k)
-        Y = Y.reshape(-1)
+        N0, C, k = D.shape
+        D = D[:, 0, :]   # reduce replicated D across classes
+        N = N0
+        return Y, D, H, N, k
+
     N, k = D.shape
     return Y, D, H, N, k
 
@@ -51,25 +58,28 @@ def solve_convex_problem_domain_anchored_smoothed_332(
     scs_max_iters=20000,
     normalize_domains=True,
     ptilde_eps=1e-15,
+    loss_type="01",   # "01" or "ce"
 ):
     """
-    Problem 3.32 = your Problem 3.22 but with the NEW epsilon constraint:
+    Problem 3.32 = Problem 3.22 but with the NEW epsilon constraint.
 
     Objective (same as 3.22):
         max_{w,Q}  sum_{i,j} w_j p_{i,j} log(q_{j|i}/w_j)
                    + (eta/k) * sum_{i,j} p_tilde[i,j] * log(q_{j|i})
 
-    Constraints (same simplex constraints):
+    Constraints:
         sum_j w_j = 1, w_j >= w_min
         sum_j q_{j|i} = 1, q_{j|i} >= q_min
 
-    NEW risk constraints (replace w^T L[:,t] <= epsilon):
+    NEW risk constraints:
         For each t:
-            sum_{i=1}^N sum_{j=1}^k q_{j|i} * p_{i,j} * (L_mat[j,t] - eps_t) <= 0
+            sum_j S_t[j] * (L_mat[j,t] - eps_t) <= 0
+        where
+            S_t[j] = sum_i D[i,t] * Q[i,j]
 
-    In matrix form:
-        Let S_j := sum_i p_{i,j} q_{j|i}  (i.e., sum_i D[i,j] * Q[i,j])
-        Then:  S^T (L_mat[:,t] - eps_t) <= 0  for all t.
+    loss_type:
+    - "01" : weighted 0-1 loss in L_mat
+    - "ce" : weighted cross-entropy loss in L_mat
     """
 
     # -------------------------
@@ -84,7 +94,14 @@ def solve_convex_problem_domain_anchored_smoothed_332(
     # -------------------------
     # Loss matrix L_mat[j,t]
     # -------------------------
-    L_mat = calculate_expected_loss(Y, H, D, k)
+    L_mat = calculate_weighted_constraint_matrix(
+        Y=Y,
+        H=H,
+        D=D,
+        num_sources=k,
+        loss_type=loss_type,
+        normalize_D_cols=True,
+    )
 
     # -------------------------
     # p_tilde for anchoring
@@ -112,7 +129,7 @@ def solve_convex_problem_domain_anchored_smoothed_332(
     objective = cp.Maximize(main_obj + anchored_smooth_obj)
 
     # -------------------------
-    # Constraints: simplex + lower bounds (unchanged)
+    # Constraints: simplex + lower bounds
     # -------------------------
     constraints = [
         cp.sum(w) == 1,
@@ -122,39 +139,18 @@ def solve_convex_problem_domain_anchored_smoothed_332(
     ]
 
     # -------------------------
-    # OLD epsilon constraints
-    #   S_j := sum_i D_{ij} Q_{ij}
-    #   For each t: S^T (L_mat[:,t] - eps_t) <= 0
-    # -------------------------
-    # S = cp.sum(cp.multiply(D, Q), axis=0)  # shape (k,)
-    #
-    # if isinstance(epsilon, (list, tuple, np.ndarray)):
-    #     eps_vec = np.asarray(epsilon).reshape(-1)
-    #     if eps_vec.shape[0] != k:
-    #         raise ValueError(f"epsilon vector must have length k={k}. Got {eps_vec.shape[0]}")
-    #     for t in range(k):
-    #         constraints.append(S @ (L_mat[:, t] - eps_vec[t]) <= 0)
-    # else:
-    #     eps_val = float(epsilon)
-    #     for t in range(k):
-    #         constraints.append(S @ (L_mat[:, t] - eps_val) <= 0)
-
-    # --------------------------------------------------------
     # NEW epsilon constraints
-    # --------------------------------------------------------
-
+    # -------------------------
     if isinstance(epsilon, (list, tuple, np.ndarray)):
         eps_vec = np.asarray(epsilon).reshape(-1)
         if eps_vec.shape[0] != k:
             raise ValueError(f"epsilon vector must have length k={k}. Got {eps_vec.shape[0]}")
-        for t in range(k):
-            S_t = cp.sum(cp.multiply(D[:, t:t + 1], Q), axis=0)  # shape (k,)
-            constraints.append(S_t @ (L_mat[:, t] - eps_vec[t]) <= 0)
     else:
-        eps_val = float(epsilon)
-        for t in range(k):
-            S_t = cp.sum(cp.multiply(D[:, t:t + 1], Q), axis=0)  # shape (k,)
-            constraints.append(S_t @ (L_mat[:, t] - eps_val) <= 0)
+        eps_vec = np.full(k, float(epsilon))
+
+    for t in range(k):
+        S_t = cp.sum(cp.multiply(D[:, t:t + 1], Q), axis=0)  # shape (k,)
+        constraints.append(S_t @ (L_mat[:, t] - eps_vec[t]) <= 0)
 
     # -------------------------
     # Solve
@@ -164,7 +160,8 @@ def solve_convex_problem_domain_anchored_smoothed_332(
     eps_print = epsilon if isinstance(epsilon, (int, float, np.floating)) else "vector"
     print(
         f"[Problem (3.32)] Solving domain-anchored smoothed optimization | "
-        f"N={N}, k={k}, epsilon={eps_print}, eta={eta:.2e}, solver={solver_type}"
+        f"N={N}, k={k}, epsilon={eps_print}, eta={eta:.2e}, "
+        f"solver={solver_type}, loss_type={loss_type}"
     )
 
     try:
@@ -210,21 +207,6 @@ def solve_convex_problem_domain_anchored_smoothed_332(
         f"({Q_val.sum(axis=1).min():.6f}, {Q_val.sum(axis=1).max():.6f}), "
         f"min entry = {Q_val.min():.2e}"
     )
-
-    # Diagnostics for the OLD constraint:
-    # For each t, compute S^T (L[:,t] - eps_t) which should be <= 0.
-    # S_val = np.sum(D * Q_val, axis=0)  # (k,)
-    #
-    # if isinstance(epsilon, (list, tuple, np.ndarray)):
-    #     eps_vec = np.asarray(epsilon).reshape(-1)
-    #     for t in range(k):
-    #         lhs = float(S_val @ (L_mat[:, t] - eps_vec[t]))
-    #         print(f"  • [Problem (3.32)] constraint(t={t}): S·(L[:,t]-eps_t) = {lhs:.4e} (<= 0)")
-    # else:
-    #     eps_val = float(epsilon)
-    #     for t in range(k):
-    #         lhs = float(S_val @ (L_mat[:, t] - eps_val))
-    #         print(f"  • [Problem (3.32)] constraint(t={t}): S·(L[:,t]-eps) = {lhs:.4e} (<= 0)")
 
     if isinstance(epsilon, (list, tuple, np.ndarray)):
         eps_vec = np.asarray(epsilon).reshape(-1)

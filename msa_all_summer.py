@@ -45,20 +45,34 @@ from cvxpy_3_32 import solve_convex_problem_domain_anchored_smoothed_332
 from cvxpy_3_33 import solve_convex_problem_smoothed_original_p_333
 
 from helpers import *
-
+from loss_functions import (
+    evaluate_solution_with_w,
+    evaluate_solution_with_q,
+    evaluate_predictions_accuracy,
+    evaluate_predictions_error_rate,
+    evaluate_predictions_cross_entropy,
+)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 os.environ["OMP_NUM_THREADS"] = "1"
 torch.set_num_threads(1)
 
 
-# TODO - CHANGED CONSTRAINT FOR 3.3... ONLY!!!!!!!!!!!!!
 # ==========================================
 # --- CONFIGURATION ---
 # ==========================================
-DATASET_MODE = "DOMAINNET"# "DIGITS"VX #"OFFICE224"VX #"OFFICE31"V DOMAINNET
+CONSTRAINT_LOSS_TYPE = "ce"   # options: "01", "ce"
+if CONSTRAINT_LOSS_TYPE == "01":
+    EVAL_METRIC = "accuracy"
+else:
+    EVAL_METRIC = "ce"
+# options: "accuracy", "error", "ce"
+FILENAME = f'Sweep_Results_{CONSTRAINT_LOSS_TYPE}_eta_grid.txt'
+DATASET_MODE = "OFFICE31"# "DIGITS"VX #"OFFICE224"VX #"OFFICE31"V DOMAINNET
+USE_ORACLE_EPSILON = True
 USE_PRECOMPUTED_D = True
 USE_ARTIFICIAL_RATIOS = True
+
 
 FORBIDDEN_EXACT_PAIRS = {
     tuple(sorted(['clipart', 'infograph'])), #V
@@ -80,20 +94,20 @@ FORBIDDEN_EXACT_PAIRS = {
 }
 
 CONFIGS = {
-    "DIGITS": {
-        "DOMAINS": ['MNIST', 'USPS', 'SVHN'],
-        "CLASSES": 10,
-        "INPUT_DIM": 784,
-        "SOURCE_ERRORS": {'MNIST': 0.005, 'USPS': 0.027, 'SVHN': 0.05},
-        "TEST_SET_SIZES": {'MNIST': 10000, 'USPS': 2007, 'SVHN': 26032},
-        "D_PRECOMP_PATH":"/data/nogaz/Convex_bounds_optimization/LatentFlow_Pixel_Experiments/results/D_Matrix_FINAL_GMM_Soft_DIGITS.npy"
-    },
+    # "DIGITS": {
+    #     "DOMAINS": ['MNIST', 'USPS', 'SVHN'],
+    #     "CLASSES": 10,
+    #     "INPUT_DIM": 784,
+    #     "SOURCE_ERRORS": {'MNIST': 0.005, 'USPS': 0.027, 'SVHN': 0.05},
+    #     "TEST_SET_SIZES": {'MNIST': 10000, 'USPS': 2007, 'SVHN': 26032},
+    #     "D_PRECOMP_PATH":"/data/nogaz/Convex_bounds_optimization/LatentFlow_Pixel_Experiments/results/D_Matrix_FINAL_GMM_Soft_DIGITS.npy"
+    # },
     "OFFICE224": {  # for office-home
         "DOMAINS": ['Art', 'Clipart', 'Product', 'Real World'],
         "CLASSES": 65,
         "INPUT_DIM": 2048,
-        "SOURCE_ERRORS": {'Art': 0.0139, 'Clipart': 0.06943, 'Product': 0.00383, 'Real World': 0.04968},
-        "SOURCE_LOSSES": {'Art': 0.05358, 'Clipart': 0.22513, 'Product': 0.01883, 'Real World': 0.132},
+        "SOURCE_LOSSES_01": {'Art': 0.0139, 'Clipart': 0.06943, 'Product': 0.00383, 'Real World': 0.04968},
+        "SOURCE_LOSSES_CR_ENT": {'Art': 0.05358, 'Clipart': 0.22513, 'Product': 0.01883, 'Real World': 0.132},
         "TEST_SET_SIZES": {'Art': 486, 'Clipart': 873, 'Product': 888, 'Real World': 872},
         "D_PRECOMP_PATH":"/data/nogaz/Convex_bounds_optimization/LatentFlow_Pixel_Experiments/results/D_Matrix_FINAL_GMM_Soft_OfficeHome.npy"
     },
@@ -101,8 +115,8 @@ CONFIGS = {
         "DOMAINS": ['amazon', 'dslr', 'webcam'],
         "CLASSES": 31,
         "INPUT_DIM": 2048,
-        "SOURCE_ERRORS": {'amazon': 0.02855, 'dslr': 1e-05, 'webcam': 0.00018},
-        "SOURCE_LOSSES": {'amazon': 0.07293, 'dslr': 0.13897, 'webcam': 0.02134},
+        "SOURCE_LOSSES_01": {'amazon': 0.02855, 'dslr': 1e-05, 'webcam': 0.00018},
+        "SOURCE_LOSSES_CR_ENT": {'amazon': 0.07293, 'dslr': 0.13897, 'webcam': 0.02134},
         "TEST_SET_SIZES": {'amazon': 564, 'dslr': 100, 'webcam': 159},
         "D_PRECOMP_PATH":"/data/nogaz/Convex_bounds_optimization/LatentFlow_Pixel_Experiments/results/D_Matrix_FINAL_GMM_Soft.npy"
     },
@@ -111,9 +125,9 @@ CONFIGS = {
         "CLASSES": 345,
         "INPUT_DIM": 2048,
         # "SOURCE_ERRORS": {'clipart': 0.0637, 'infograph': 0.1523, 'painting': 0.0656, 'quickdraw': 0.1512, 'real': 0.0382, 'sketch': 0.0796},
-        "SOURCE_ERRORS": {'clipart': 0.41511, 'infograph': 0.78587, 'painting': 0.32533, 'quickdraw': 0.30616,
+        "SOURCE_LOSSES_01": {'clipart': 0.41511, 'infograph': 0.78587, 'painting': 0.32533, 'quickdraw': 0.30616,
                           'real': 0.13799, 'sketch': 0.37851},
-        "SOURCE_LOSSES": {'clipart': 2.30216, 'infograph': 5.11777, 'painting': 1.90294, 'quickdraw': 1.26597,
+        "SOURCE_LOSSES_CR_ENT": {'clipart': 2.30216, 'infograph': 5.11777, 'painting': 1.90294, 'quickdraw': 1.26597,
                           'real': 0.77012, 'sketch': 2.13864},
 
         "TEST_SET_SIZES": {'clipart': 14604, 'infograph': 15582, 'painting': 21850, 'quickdraw': 51750, 'real': 52041, 'sketch': 20916},
@@ -122,11 +136,11 @@ CONFIGS = {
 }
 
 TARGET_RATIOS_CONFIG = {
-    # --- DIGITS (MNIST, USPS, SVHN) ---
-    ('MNIST', 'USPS'): {'MNIST': 0.85, 'USPS': 0.15},
-    ('MNIST', 'SVHN'): {'MNIST': 0.20, 'SVHN': 0.80},
-    ('SVHN', 'USPS'): {'SVHN': 0.75, 'USPS': 0.25},
-    ('MNIST', 'SVHN', 'USPS'): {'MNIST': 0.60, 'SVHN': 0.30, 'USPS': 0.10},
+    # # --- DIGITS (MNIST, USPS, SVHN) ---
+    # ('MNIST', 'USPS'): {'MNIST': 0.85, 'USPS': 0.15},
+    # ('MNIST', 'SVHN'): {'MNIST': 0.20, 'SVHN': 0.80},
+    # ('SVHN', 'USPS'): {'SVHN': 0.75, 'USPS': 0.25},
+    # ('MNIST', 'SVHN', 'USPS'): {'MNIST': 0.60, 'SVHN': 0.30, 'USPS': 0.10},
 
     # --- OFFICE-31 (amazon, dslr, webcam) ---
     ('amazon', 'dslr'): {'amazon': 0.20, 'dslr': 0.80},
@@ -245,11 +259,17 @@ TARGET_RATIOS_CONFIG = {
 }
 
 CURRENT_CFG = CONFIGS[DATASET_MODE]
-SOURCE_ERRORS = CURRENT_CFG["SOURCE_ERRORS"]
 TEST_SET_SIZES = CURRENT_CFG["TEST_SET_SIZES"]
 ALL_DOMAINS_LIST = CURRENT_CFG["DOMAINS"]
 NUM_CLASSES = CURRENT_CFG["CLASSES"]
 INPUT_DIM = CURRENT_CFG["INPUT_DIM"]
+
+if CONSTRAINT_LOSS_TYPE == "01":
+    SOURCE_CONSTRAINT_VALUES = CURRENT_CFG["SOURCE_LOSSES_01"]
+elif CONSTRAINT_LOSS_TYPE == "ce":
+    SOURCE_CONSTRAINT_VALUES = CURRENT_CFG["SOURCE_LOSSES_CR_ENT"]
+else:
+    raise ValueError(f"Unknown CONSTRAINT_LOSS_TYPE: {CONSTRAINT_LOSS_TYPE}")
 
 # ==========================================
 # --- OPTIONAL: Use precomputed Global D ---
@@ -387,6 +407,36 @@ def make_loader(dataset, batch_size, shuffle=False, num_workers=4, pin_memory=Tr
         pin_memory=pin_memory,
     )
 
+def evaluate_oracle_any_ce_lower_bound(H, Y, eps=1e-12):
+    """
+    Cross-entropy lower bound based on per-sample oracle-any:
+    for each sample, take the maximal probability assigned by any source
+    to the true class, then compute CE.
+
+    H: (N, C, K)
+    Y: (N, C) one-hot
+    """
+    H = np.asarray(H)
+    Y = np.asarray(Y)
+
+    y_true = Y.argmax(axis=1)                              # (N,)
+    true_class_probs = H[np.arange(len(y_true)), y_true, :]  # (N, K)
+    best_true_prob = np.max(true_class_probs, axis=1)        # (N,)
+
+    ce_lb = -np.mean(np.log(np.clip(best_true_prob, eps, 1.0)))
+    return ce_lb
+
+def evaluate_preds_with_metric(preds, Y, metric):
+    metric = metric.lower()
+
+    if metric == "accuracy":
+        return evaluate_predictions_accuracy(preds, Y)
+    if metric == "error":
+        return evaluate_predictions_error_rate(preds, Y)
+    if metric == "ce":
+        return evaluate_predictions_cross_entropy(preds, Y)
+
+    raise ValueError(f"Unsupported metric='{metric}'")
 
 def get_train_test_loaders_and_indices(domain: str, seed: int, batch_size=64, test_batch_size=64):
     if DATASET_MODE == 'DIGITS':
@@ -560,70 +610,147 @@ def run_baselines(Y, D, H, source_domains, target_domains, all_source_domains, s
     print(" [Baseline] Running Oracle, Uniform, and Best Single Source...")
     buf = io.StringIO()
 
+    metric_label = {
+        "accuracy": "acc",
+        "error": "err",
+        "ce": "ce",
+    }[EVAL_METRIC]
+
     # --- 1. Oracle & Uniform ---
     uniform_w = np.ones(len(source_domains)) / len(source_domains)
     for name, w in [("ORACLE", true_r_weights), ("UNIFORM", uniform_w)]:
-        acc = evaluate_accuracy_wd(w, D, H, Y)
-        w_f = map_weights_to_full_source_list(w, source_domains, all_source_domains)
-        buf.write(f"{name:<18} | {'N/A':<15} | {'N/A':<15} | {acc:<12.2f} | {str(np.round(w_f, 4))}\n")
-        print(f" >>> [Baseline] {name:<7} | Acc: {acc:.2f}%")
+        score = evaluate_solution_with_w(w, D, H, Y, metric=EVAL_METRIC)
+        if name == "ORACLE":
+            if CONSTRAINT_LOSS_TYPE == "01":
+                oracle_epsilon = 1.0 - (score / 100.0)
+            else:  # "ce"
+                oracle_epsilon = score
+            buf.write(
+                f"[ORACLE_EPSILON] constraint_type={CONSTRAINT_LOSS_TYPE} | oracle_epsilon={oracle_epsilon:.6f}\n")
 
-    # --- 2. Best Single Source (New) ---
-    # H has shape (N, C, K). We check which k in range(K) gives the best accuracy.
-    y_true = Y.argmax(axis=1)
-    best_single_acc = -1.0
+        w_f = map_weights_to_full_source_list(w, source_domains, all_source_domains)
+
+        buf.write(
+            f"{name:<18} | {'N/A':<15} | {'N/A':<15} | {score:<12.2f} | {str(np.round(w_f, 4))}\n"
+        )
+        print(f" >>> [Baseline] {name:<7} | {metric_label}: {score:.2f}")
+
+    print("BASELINE DEBUG")
+    print("source_domains:", source_domains)
+    print("uniform_w local:", uniform_w)
+    print("oracle_w local:", true_r_weights)
+    print("uniform_ce direct:", evaluate_solution_with_w(uniform_w, D, H, Y, metric="ce"))
+    print("oracle_ce direct:", evaluate_solution_with_w(true_r_weights, D, H, Y, metric="ce"))
+
+    # --- 2. Best Single Source ---
+    best_single_score = None
     best_source_name = ""
     best_source_idx = -1
 
     for k, src_name in enumerate(source_domains):
-        # Predict using only source k: H[:, :, k]
-        src_preds = H[:, :, k].argmax(axis=1)
-        src_acc = accuracy_score(y_true, src_preds) * 100.0
+        src_preds = H[:, :, k]   # (N, C)
+        src_score = evaluate_preds_with_metric(src_preds, Y, EVAL_METRIC)
 
-        if src_acc > best_single_acc:
-            best_single_acc = src_acc
+        if best_single_score is None:
+            best_single_score = src_score
             best_source_name = src_name
             best_source_idx = k
+        else:
+            if EVAL_METRIC == "accuracy":
+                is_better = src_score > best_single_score
+            else:
+                is_better = src_score < best_single_score
 
-    # Create a one-hot weight vector for the best source for the output log
+            if is_better:
+                best_single_score = src_score
+                best_source_name = src_name
+                best_source_idx = k
+
     w_best_single = np.zeros(len(source_domains))
     w_best_single[best_source_idx] = 1.0
     w_f_best = map_weights_to_full_source_list(w_best_single, source_domains, all_source_domains)
 
     buf.write(
-        f"{'BEST_SINGLE_SRC':<18} | {best_source_name:<15} | {'N/A':<15} | {best_single_acc:<12.2f} | {str(np.round(w_f_best, 4))}\n")
-    print(f" >>> [Baseline] BEST_SINGLE_SRC ({best_source_name}) | Acc: {best_single_acc:.2f}%")
+        f"{'BEST_SINGLE_SRC':<18} | {best_source_name:<15} | {'N/A':<15} | "
+        f"{best_single_score:<12.2f} | {str(np.round(w_f_best, 4))}\n"
+    )
+    print(f" >>> [Baseline] BEST_SINGLE_SRC ({best_source_name}) | {metric_label}: {best_single_score:.2f}")
 
-    # --- 3. Oracle Any Correct ---
+    # --- 3. Oracle Any Correct / CE Lower Bound ---
+    y_true = Y.argmax(axis=1)
     pred_per_source = H.argmax(axis=1)  # (N, K)
     any_correct = (pred_per_source == y_true[:, None]).any(axis=1)
-    oracle_any_acc = any_correct.mean() * 100.0
 
-    buf.write(f"{'ORACLE_ANY_CORRECT':<18} | {'N/A':<15} | {'N/A':<15} | {oracle_any_acc:<12.2f} | N/A\n")
-    print(f" >>> [Baseline] ORACLE_ANY_CORRECT | Acc: {oracle_any_acc:.2f}%")
+    oracle_any_acc = any_correct.mean() * 100.0
+    oracle_any_err = 1.0 - any_correct.mean()
+    oracle_any_ce_lb = evaluate_oracle_any_ce_lower_bound(H, Y)
+
+    if EVAL_METRIC == "accuracy":
+        oracle_any_name = "ORACLE_ANY_CORRECT"
+        oracle_any_score = oracle_any_acc
+    elif EVAL_METRIC == "error":
+        oracle_any_name = "ORACLE_ANY_CORRECT"
+        oracle_any_score = oracle_any_err
+    elif EVAL_METRIC == "ce":
+        oracle_any_name = "ORACLE_ANY_CE_LB"
+        oracle_any_score = oracle_any_ce_lb
+    else:
+        raise ValueError(f"Unsupported EVAL_METRIC={EVAL_METRIC}")
+
+    buf.write(
+        f"{oracle_any_name:<18} | {'N/A':<15} | {'N/A':<15} | "
+        f"{oracle_any_score:<12.2f} | N/A\n"
+    )
+
+    buf.write(
+        f"[ORACLE_ANY_DETAILS] acc={oracle_any_acc:.4f} | "
+        f"err={oracle_any_err:.6f} | ce_lb={oracle_any_ce_lb:.6f}\n"
+    )
+
+    if EVAL_METRIC == "ce":
+        print(f" >>> [Baseline] ORACLE_ANY_CE_LB | ce: {oracle_any_ce_lb:.6f}")
+    else:
+        print(f" >>> [Baseline] ORACLE_ANY_CORRECT | {metric_label}: {oracle_any_score:.2f}")
 
     # --- 4. DC Solver ---
     print(" [Baseline] Running DC Solver...")
-    dc_accuracies, best_z_dc = [], None
+    dc_scores, best_z_dc = [], None
+    best_dc_score = None
+
     for i in range(5):
         try:
             dp = init_problem_from_model_fast(Y, D, H, p=len(source_domains), C=NUM_CLASSES)
             slv = ConvexConcaveSolverFast(ConvexConcaveProblemFast(dp), seed + (i * 100), "err")
             z_dc, _, _ = slv.solve()
+
             if z_dc is not None:
-                acc = evaluate_accuracy_wd(z_dc, D, H, Y)
-                dc_accuracies.append(acc)
-                if best_z_dc is None or acc >= max(dc_accuracies):
+                score = evaluate_solution_with_w(z_dc, D, H, Y, metric=EVAL_METRIC)
+                dc_scores.append(score)
+
+                if best_dc_score is None:
+                    best_dc_score = score
                     best_z_dc = z_dc
+                else:
+                    if EVAL_METRIC == "accuracy":
+                        is_better = score > best_dc_score
+                    else:
+                        is_better = score < best_dc_score
+
+                    if is_better:
+                        best_dc_score = score
+                        best_z_dc = z_dc
         except:
             continue
-    if dc_accuracies:
-        avg_res = f"{np.mean(dc_accuracies):.2f}±{np.std(dc_accuracies):.2f}"
+
+    if dc_scores:
+        avg_res = f"{np.mean(dc_scores):.2f}±{np.std(dc_scores):.2f}"
         w_f = map_weights_to_full_source_list(best_z_dc, source_domains, all_source_domains)
-        buf.write(f"{'DC (5-Seeds)':<18} | {'N/A':<15} | {'N/A':<15} | {avg_res:<12} | {str(np.round(w_f, 4))}\n")
+        buf.write(
+            f"{'DC (5-Seeds)':<18} | {'N/A':<15} | {'N/A':<15} | {avg_res:<12} | "
+            f"{str(np.round(w_f, 4))}\n"
+        )
 
-    return buf.getvalue()
-
+    return buf.getvalue(), oracle_epsilon
 
 # from cvxpy_3_21 import solve_convex_problem_smoothed_kl_321
 # from cvxpy_3_22 import solve_convex_problem_domain_anchored_smoothed
@@ -631,22 +758,39 @@ def run_baselines(Y, D, H, source_domains, target_domains, all_source_domains, s
 
 
 def run_solver_sweep_worker(Y, D, H, eps_mult, source_domains, all_source_domains, save_dir,
-    strategy_name=None, target_domains=None, true_r_weights=None,
+    strategy_name=None, target_domains=None, true_r_weights=None,oracle_epsilon=None,
 ):
     print(f" [Worker] Starting sweep for Epsilon Mult: {eps_mult}")
     buf = io.StringIO()
 
-    errors = np.array([(SOURCE_ERRORS.get(d, 0.1) + 0.05) * eps_mult for d in source_domains])
+    errors = np.array([
+        (SOURCE_CONSTRAINT_VALUES.get(d, 0.1) + 0.05) * eps_mult
+        for d in source_domains
+    ])
+
+    old_epsilon = float(np.max(errors))
+
+    if USE_ORACLE_EPSILON and oracle_epsilon is not None:
+        epsilon_used = float(oracle_epsilon) * eps_mult
+    else:
+        epsilon_used = old_epsilon
+
+    buf.write(
+        f"[EPSILON_INFO] eps_mult={eps_mult} | "
+        f"old_epsilon={old_epsilon:.6f} | "
+        f"oracle_epsilon={oracle_epsilon:.6f} | "
+        f"epsilon_used={epsilon_used:.6f}\n"
+    )
+
     max_ent = np.log(len(source_domains)) if len(source_domains) > 1 else 0.1
 
-    SOLVERS = ["3.31", "3.33"] # "3.32", "3.21", "3.22", "3.23", "CVXPY_GLOBAL",
+    SOLVERS = ["CVXPY_GLOBAL", "3.31","3.32", "3.33"] # "3.32", "3.21", "3.22", "3.23", "CVXPY_GLOBAL",
     BACKENDS = ["SCS"]# , "MOSEK"]   # <- run both
-    DELTA_MULTS = [1.2]#, 1.2]
-
+    ETAS = [1e-8, 1e-4, 1e-1, 1.0]# [1.2]#, 1.2]
+    mult = 1.2
     for solver in SOLVERS:
-        for mult in DELTA_MULTS:
+        for eta in ETAS:
             delta = mult * max_ent
-
             for backend in BACKENDS:
                 try:
                     # ----------------------------
@@ -656,44 +800,52 @@ def run_solver_sweep_worker(Y, D, H, eps_mult, source_domains, all_source_domain
                         w, Q = solve_convex_problem_mosek(
                             Y, D, H,
                             delta=delta,
-                            epsilon=float(np.max(errors)),
-                            solver_type=backend
+                            epsilon=float(epsilon_used),
+                            solver_type=backend,
+                            loss_type=CONSTRAINT_LOSS_TYPE,
                         )
-                    elif solver == "3.21":
-                        w, Q = solve_convex_problem_smoothed_kl_321(
-                            Y, D, H,
-                            epsilon=float(np.max(errors)),
-                            solver_type=backend
-                        )
-                    elif solver == "3.22":
-                        w, Q = solve_convex_problem_domain_anchored_smoothed(
-                            Y, D, H,
-                            epsilon=float(np.max(errors)),
-                            solver_type=backend
-                        )
-                    elif solver == "3.23":
-                        w, Q = solve_convex_problem_smoothed_original_p(
-                            Y, D, H,
-                            epsilon=float(np.max(errors)),
-                            solver_type=backend
-                        )
+                    # elif solver == "3.21":
+                    #     w, Q = solve_convex_problem_smoothed_kl_321(
+                    #         Y, D, H,
+                    #         epsilon=float(epsilon_used),
+                    #         solver_type=backend
+                    #     )
+                    # elif solver == "3.22":
+                    #     w, Q = solve_convex_problem_domain_anchored_smoothed(
+                    #         Y, D, H,
+                    #         epsilon=float(epsilon_used),
+                    #         solver_type=backend
+                    #     )
+                    # elif solver == "3.23":
+                    #     w, Q = solve_convex_problem_smoothed_original_p(
+                    #         Y, D, H,
+                    #         epsilon=float(epsilon_used),
+                    #         solver_type=backend
+                    #     )
                     elif solver == "3.31":
                         w, Q = solve_convex_problem_smoothed_kl_331(
                             Y, D, H,
-                            epsilon=float(np.max(errors)),
-                            solver_type=backend
+                            epsilon=float(epsilon_used),
+                            eta=eta,
+                            solver_type=backend,
+                            loss_type=CONSTRAINT_LOSS_TYPE,
+
                         )
                     elif solver == "3.32":
                         w, Q = solve_convex_problem_domain_anchored_smoothed_332(
                             Y, D, H,
-                            epsilon=float(np.max(errors)),
-                            solver_type=backend
+                            epsilon=float(epsilon_used),
+                            eta=eta,
+                            solver_type=backend,
+                            loss_type=CONSTRAINT_LOSS_TYPE,
                         )
                     elif solver == "3.33":
                         w, Q = solve_convex_problem_smoothed_original_p_333(
                             Y, D, H,
-                            epsilon=float(np.max(errors)),
-                            solver_type=backend
+                            epsilon=float(epsilon_used),
+                            eta=eta,
+                            solver_type=backend,
+                            loss_type=CONSTRAINT_LOSS_TYPE,
                         )
 
                     else:
@@ -708,36 +860,51 @@ def run_solver_sweep_worker(Y, D, H, eps_mult, source_domains, all_source_domain
                         buf.write(f"[{solver}/{backend}] Returned None (likely infeasible)\n")
                         continue
 
-                    save_qstar_artifact(
-                        base_dir=save_dir, Q=Q, w=w, Y=Y,
-                        source_domains=source_domains,
-                        all_source_domains=all_source_domains, solver=solver, backend=backend, eps_mult=eps_mult,
-                        delta_mult=mult, dataset_mode=DATASET_MODE, strategy_name=strategy_name,
-                        target_domains=target_domains if target_domains is not None else source_domains,
-                        true_r_weights=true_r_weights,
-                        extra_info={
-                            "errors": errors.tolist(),
-                            "max_entropy": float(max_ent),
-                            "epsilon_used": float(np.max(errors)),
-                        },
-                    )
+                    # save_qstar_artifact(
+                    #     base_dir=save_dir, Q=Q, w=w, Y=Y,
+                    #     source_domains=source_domains,
+                    #     all_source_domains=all_source_domains, solver=solver, backend=backend, eps_mult=eps_mult,
+                    #     delta_mult=mult, dataset_mode=DATASET_MODE, strategy_name=strategy_name,
+                    #     target_domains=target_domains if target_domains is not None else source_domains,
+                    #     true_r_weights=true_r_weights,
+                    #     extra_info={
+                    #         "errors": errors.tolist(),
+                    #         "max_entropy": float(max_ent),
+                    #         "epsilon_used": float(np.max(errors)),
+                    #     },
+                    # )
                     # ----------------------------
                     # evaluate (same code path!)
                     # ----------------------------
-                    acc_w = evaluate_accuracy_wd(w, D, H, Y)
-                    acc_q = evaluate_accuracy_q(Q, H, Y)
+                    score_w = evaluate_solution_with_w(w, D, H, Y, metric=EVAL_METRIC)
+                    score_q = evaluate_solution_with_q(Q, H, Y, metric=EVAL_METRIC)
 
                     w_f = map_weights_to_full_source_list(w, source_domains, all_source_domains)
 
                     # print with backend explicitly + full precision weights (optional)
+                    metric_label = {
+                        "accuracy": "acc",
+                        "error": "err",
+                        "ce": "ce",
+                    }[EVAL_METRIC]
+
+                    # if solver == "3.33":
+                    #     print("SOLVER DEBUG")
+                    #     print("w local:", w)
+                    #     print("solver_ce direct:", evaluate_solution_with_w(w, D, H, Y, metric="ce"))
+                    #     print("uniform_ce same place:",
+                    #           evaluate_solution_with_w(np.ones(len(source_domains)) / len(source_domains), D, H, Y,
+                    #                                    metric="ce"))
+
                     buf.write(
-                        f"{solver:<12} | {backend:<5} | m:{eps_mult:<4} | d_m:{mult:<3} "
-                        f"| acc_W: {acc_w:>6.2f} | acc_Q: {acc_q:>6.2f} | W: {np.array2string(w_f, precision=6)}\n"
+                        f"{solver:<12} | {backend:<5} | m:{eps_mult:<4} | eta:{eta:<3} "
+                        f"| {metric_label}_W: {score_w:>6.2f} | {metric_label}_Q: {score_q:>6.2f} "
+                        f"| W: {np.array2string(w_f, precision=6)}\n"
                     )
 
                 except Exception as e:
                     tb = traceback.format_exc()
-                    msg = f"[{solver}/{backend}] ERROR eps_mult={eps_mult} delta_mult={mult}: {repr(e)}\n{tb}\n"
+                    msg = f"[{solver}/{backend}] ERROR eps_mult={eps_mult} eta={eta}: {repr(e)}\n{tb}\n"
                     print(msg)
                     buf.write(msg)
 
@@ -851,13 +1018,15 @@ def task_run(classifiers, all_source_domains):
         if Global_D is not None:
             domain_lengths = compute_domain_lengths(all_source_domains)
 
-    filename = f'Sweep_Results_{seed}_3_sets_all_baselines_new_constr.txt'
+    # filename = f'Sweep_Results_{seed}_ce.txt'
 
-    with open(os.path.join(test_path, filename), 'a') as fp:
+    with open(os.path.join(test_path, FILENAME), 'a') as fp:
         for target in [list(s) for r in range(2, len(all_source_domains) + 1) for s in
                        itertools.combinations(all_source_domains, r)]:
 
             target_tuple = tuple(sorted(target))
+            # if target_tuple != tuple(sorted(["amazon", "webcam"])):
+            #     continue
 
             if target_tuple in FORBIDDEN_EXACT_PAIRS:
                 print(f"⏭️ Skipping exact forbidden pair: {target}")
@@ -903,6 +1072,8 @@ def task_run(classifiers, all_source_domains):
             gc.collect()
 
             for strategy_name, custom_ratios in weight_sets:
+                # if strategy_name != "CONFIG_INVERSE": # TODO DELETE
+                #     continue
                 print(f"  -> Strategy: {strategy_name} | {custom_ratios}")
 
                 Y, D, H = apply_custom_ratios(Y_full, D_full, H_full, target, custom_ratios)
@@ -913,7 +1084,36 @@ def task_run(classifiers, all_source_domains):
                 fp.write(
                     f"\n{'=' * 100}\nTARGET: {target} | STRATEGY: {strategy_name}\nRATIOS: {np.round(true_r_full, 4)}\n{'=' * 100}\n")
 
-                fp.write(run_baselines(Y, D, H, target, target, all_source_domains, seed, true_r_weights))
+                baseline_text, oracle_epsilon = run_baselines(
+                    Y, D, H, target, target, all_source_domains, seed, true_r_weights
+                )
+                fp.write(baseline_text)
+                #     ############# TODO DELETE
+            #     if tuple(sorted(target)) == tuple(sorted(["amazon", "webcam"])) and strategy_name == "CONFIG_INVERSE":
+            #         print("\n" + "=" * 80)
+            #         print("RUNNING DEBUG FOR amazon/webcam + CONFIG_INVERSE")
+            #         print("=" * 80)
+            #
+            #         oracle_local = true_r_weights
+            #         uniform_local = np.ones(len(target)) / len(target)
+            #
+            #         # לפי הסדר של target = ['amazon', 'webcam']
+            #         dc_local = np.array([0.0005, 0.9995])
+            #         solver_local = np.array([0.500411, 0.49959])
+            #
+            #         debug_ce_mixture_case(
+            #             Y=Y,
+            #             D=D,
+            #             H=H,
+            #             source_domains=target,
+            #             oracle_w=oracle_local,
+            #             uniform_w=uniform_local,
+            #             dc_w=dc_local,
+            #             solver_w=solver_local,
+            #             single_source_name="webcam",
+            #             top_k_samples=15,
+            #         )
+            # #####################
 
                 results = Parallel(n_jobs=2, verbose=5)(
                     delayed(run_solver_sweep_worker)(
@@ -927,6 +1127,7 @@ def task_run(classifiers, all_source_domains):
                         strategy_name=strategy_name,
                         target_domains=target,
                         true_r_weights=true_r_weights,
+                        oracle_epsilon=oracle_epsilon,
                     )
                     for e in [1.0, 2.0]
                 )
@@ -1037,5 +1238,199 @@ def main():
     task_run(classifiers, ALL_DOMAINS_LIST)
 
 
+
+#--------------------------------------------
+import numpy as np
+
+from loss_functions import (
+    combine_predictions_with_w,
+    evaluate_predictions_cross_entropy,
+)
+
+def debug_ce_mixture_case(
+    Y,
+    D,
+    H,
+    source_domains,
+    oracle_w,
+    uniform_w,
+    dc_w,
+    solver_w=None,
+    single_source_name="webcam",
+    top_k_samples=10,
+    eps=1e-12,
+):
+    """
+    Explicit sanity-check / explanation for CE gaps between:
+    - BEST_SINGLE_SRC (raw source only)
+    - BEST_SINGLE via WD with one-hot w
+    - ORACLE
+    - UNIFORM
+    - DC
+    - optional solver W
+
+    Inputs
+    ------
+    Y : (N, C)
+    D : (N, K) or (N, C, K)
+    H : (N, C, K)
+    source_domains : list[str]
+    oracle_w, uniform_w, dc_w, solver_w : shape (K,)
+    single_source_name : e.g. "webcam"
+    """
+
+    Y = np.asarray(Y)
+    H = np.asarray(H)
+
+    if D.ndim == 3:
+        D2 = D[:, 0, :]
+    else:
+        D2 = np.asarray(D)
+
+    N, K = D2.shape
+    y_true = Y.argmax(axis=1)
+    single_idx = source_domains.index(single_source_name)
+
+    def ce_of_probs(probs):
+        return evaluate_predictions_cross_entropy(probs, Y)
+
+    def effective_alpha(D2, w, eps=1e-12):
+        """
+        alpha[i,j] = w_j D[i,j] / sum_s w_s D[i,s]
+        """
+        w = np.asarray(w, dtype=float).reshape(1, -1)  # (1,K)
+        numer = D2 * w                                  # (N,K)
+        denom = numer.sum(axis=1, keepdims=True)        # (N,1)
+        alpha = numer / np.clip(denom, eps, None)
+        return alpha
+
+    def summarize_w_case(name, w):
+        probs = combine_predictions_with_w(w, D2, H)
+        ce = ce_of_probs(probs)
+        alpha = effective_alpha(D2, w, eps=eps)
+
+        print(f"\n{name}")
+        print("-" * len(name))
+        print(f"w = {np.round(w, 6)}")
+        print(f"CE = {ce:.6f}")
+        print("Mean effective alpha per source:")
+        for j, dom in enumerate(source_domains):
+            print(f"  {dom:<10}: mean={alpha[:, j].mean():.6f}, "
+                  f"min={alpha[:, j].min():.6f}, max={alpha[:, j].max():.6f}")
+
+        return probs, ce, alpha
+
+    # --------------------------------------------------
+    # 1) BEST_SINGLE_SRC raw
+    # --------------------------------------------------
+    raw_single_probs = H[:, :, single_idx]
+    raw_single_ce = ce_of_probs(raw_single_probs)
+
+    print("\nBEST_SINGLE_SRC (RAW)")
+    print("---------------------")
+    print(f"source = {single_source_name}")
+    print(f"one-hot w = {[1.0 if j == single_idx else 0.0 for j in range(K)]}")
+    print(f"CE(raw source only) = {raw_single_ce:.6f}")
+
+    # --------------------------------------------------
+    # 2) BEST_SINGLE via WD with one-hot
+    # --------------------------------------------------
+    one_hot_w = np.zeros(K)
+    one_hot_w[single_idx] = 1.0
+
+    onehot_probs, onehot_ce, onehot_alpha = summarize_w_case(
+        name=f"BEST_SINGLE_WD ({single_source_name})",
+        w=one_hot_w
+    )
+
+    # Check raw vs WD-onehot
+    max_abs_diff = np.max(np.abs(raw_single_probs - onehot_probs))
+    print(f"\nSanity check: max |RAW - WD_onehot| = {max_abs_diff:.12f}")
+    print(f"Sanity check: CE difference = {abs(raw_single_ce - onehot_ce):.12f}")
+
+    # --------------------------------------------------
+    # 3) ORACLE / UNIFORM / DC / SOLVER
+    # --------------------------------------------------
+    oracle_probs, oracle_ce, oracle_alpha = summarize_w_case("ORACLE", oracle_w)
+    uniform_probs, uniform_ce, uniform_alpha = summarize_w_case("UNIFORM", uniform_w)
+    dc_probs, dc_ce, dc_alpha = summarize_w_case("DC", dc_w)
+
+    solver_probs = solver_ce = solver_alpha = None
+    if solver_w is not None:
+        solver_probs, solver_ce, solver_alpha = summarize_w_case("SOLVER_W", solver_w)
+
+    # --------------------------------------------------
+    # 4) Why can DC differ from BEST_SINGLE even if w is almost one-hot?
+    #    Look at samples where alpha for amazon is non-negligible
+    # --------------------------------------------------
+    if "amazon" in source_domains:
+        amazon_idx = source_domains.index("amazon")
+        webcam_idx = source_domains.index("webcam") if "webcam" in source_domains else None
+
+        # Samples where DC still gives some effective mass to amazon
+        order = np.argsort(-dc_alpha[:, amazon_idx])  # descending by alpha_amazon
+        top_idx = order[:top_k_samples]
+
+        print("\nTop samples where DC still gives effective weight to amazon")
+        print("-----------------------------------------------------------")
+        header = (
+            "idx | y_true | alpha_amazon(DC) | alpha_webcam(DC) | "
+            "p_true_amazon | p_true_webcam | p_true_DC | p_true_UNIFORM | p_true_ORACLE"
+        )
+        print(header)
+
+        for i in top_idx:
+            p_true_amazon = H[i, y_true[i], amazon_idx]
+            p_true_webcam = H[i, y_true[i], webcam_idx] if webcam_idx is not None else np.nan
+            p_true_dc = dc_probs[i, y_true[i]]
+            p_true_uniform = uniform_probs[i, y_true[i]]
+            p_true_oracle = oracle_probs[i, y_true[i]]
+
+            alpha_webcam_val = dc_alpha[i, webcam_idx] if webcam_idx is not None else np.nan
+
+            print(
+                f"{i:>3} | {y_true[i]:>6} | "
+                f"{dc_alpha[i, amazon_idx]:>16.6f} | "
+                f"{alpha_webcam_val:>15.6f} | "
+                f"{p_true_amazon:>13.6f} | "
+                f"{p_true_webcam:>13.6f} | "
+                f"{p_true_dc:>9.6f} | "
+                f"{p_true_uniform:>14.6f} | "
+                f"{p_true_oracle:>13.6f}"
+            )
+
+    # --------------------------------------------------
+    # 5) Compare CE gaps directly
+    # --------------------------------------------------
+    print("\nCE summary")
+    print("----------")
+    print(f"BEST_SINGLE_RAW        : {raw_single_ce:.6f}")
+    print(f"BEST_SINGLE_WD(onehot) : {onehot_ce:.6f}")
+    print(f"UNIFORM                : {uniform_ce:.6f}")
+    print(f"ORACLE                 : {oracle_ce:.6f}")
+    print(f"DC                     : {dc_ce:.6f}")
+    if solver_ce is not None:
+        print(f"SOLVER_W               : {solver_ce:.6f}")
+
+    print("\nPairwise differences")
+    print("--------------------")
+    print(f"DC - BEST_SINGLE_RAW   : {dc_ce - raw_single_ce:+.6f}")
+    print(f"DC - ORACLE            : {dc_ce - oracle_ce:+.6f}")
+    print(f"SOLVER_W - ORACLE      : "
+          f"{(solver_ce - oracle_ce):+.6f}" if solver_ce is not None else "N/A")
+
+    return {
+        "raw_single_ce": raw_single_ce,
+        "onehot_ce": onehot_ce,
+        "oracle_ce": oracle_ce,
+        "uniform_ce": uniform_ce,
+        "dc_ce": dc_ce,
+        "solver_ce": solver_ce,
+        "dc_alpha": dc_alpha,
+        "oracle_alpha": oracle_alpha,
+        "uniform_alpha": uniform_alpha,
+        "solver_alpha": solver_alpha,
+    }
+#--------------------------------------------------------------------
 if __name__ == "__main__":
     main()
