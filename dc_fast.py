@@ -5,7 +5,7 @@ import numpy as np
 
 class init_problem_from_model_fast:
     def __init__(self, y, D, h, p=3, C=10):
-        self.y = np.array(y, copy=True)
+        self.y = np.asarray(y, dtype=np.float32)
         self.n = len(self.y)
 
         self.p = p  # number of domains
@@ -13,8 +13,8 @@ class init_problem_from_model_fast:
         self.U = 1.0 / self.n  # unif dist
         self.eta = 0.01
 
-        self.D = np.array(D, dtype=float, copy=True)
-        self.h = np.array(h, copy=True)
+        self.D = np.asarray(D, dtype=np.float32).copy()
+        self.h = np.asarray(h, dtype=np.float32)
 
         # Calculate the upper bound.
         self.load_M_fast()
@@ -127,7 +127,7 @@ class ConvexConcaveSolverFast:
             print(s)
 
     def check_converged(self, obj, obj_prev, sub_iter=False, disp=True):
-        thresh = obj * 1e-8
+        thresh = max(1e-5, abs(obj) * 1e-5)
         o_change = np.abs(obj - obj_prev)
         converged = False
 
@@ -145,7 +145,7 @@ class ConvexConcaveSolverFast:
 
         return converged
 
-    def solve_convex_iter_fast(self, zt, delta=1, max_iter=100, disp=False):
+    def solve_convex_iter_fast(self, zt, delta=1, max_iter=70, disp=False):
         g_obj = self.problem.compute_obj(zt)
         k = np.argmax(g_obj)
 
@@ -256,9 +256,16 @@ class ConvexConcaveSolverFast:
 class ConvexConcaveProblemFast(object):
     def __init__(self, DP):
         self.D = DP.get_marginal_density()
-        sc = self.D.sum(axis=1)
-        self.D = self.D / sc.max()
-        self.U = DP.U / sc.max()
+
+        if self.D.ndim == 2:
+            sc = self.D.sum(axis=1)
+        else:
+            sc = self.D.sum(axis=(0, 1))
+
+        scale = max(float(sc.max()), 1e-12)
+
+        self.D = self.D / scale
+        self.U = DP.U / scale
         self.h = DP.get_regressor()
         self.y = DP.get_true_values()
         self.etaU = DP.eta * self.U
@@ -266,7 +273,7 @@ class ConvexConcaveProblemFast(object):
         self.p = DP.p
         self.H = 1.0 / DP.p * self.h.sum(axis=1)
         self.C = DP.C
-
+        
     def compute_convex_fast(self, z):
         Dz, Jz, Kz, hz = self.compute_DzJzKzhz_fast(z)
         err = (hz - self.y) ** 2
@@ -304,13 +311,31 @@ class ConvexConcaveProblemFast(object):
     def compute_DzJzKzhz_fast(self, z):
         """
         Assumes D and h have domain index in last place.
-        Either D = Dx in [N,p] or D = Dxy in [N,C,p] / [*,*,p]
+
+        Supported cases:
+        1) h shape = (N, K)
+           D shape = (N, K)
+           Legacy hard-label / regressor-style path.
+
+        2) h shape = (N, C, K)
+           D shape = (N, K)
+           Sample-level source densities, shared across classes.
+
+        3) h shape = (N, C, K)
+           D shape = (N, C, K)
+           Class-level source densities.
         """
+        z = np.asarray(z, dtype=self.h.dtype).reshape(-1)
+
+        # --------------------------------------------------
+        # Case 1: h is (N, K)
+        # --------------------------------------------------
         if len(self.h.shape) == 2:
             n = len(self.h)
 
-            z_mat = np.tile(z.flatten(), (self.D.shape[0], 1))
-            zD = z_mat * self.D
+            # zD: (N, K)
+            zD = self.D * z.reshape(1, -1)
+
             Dz_full = zD
             Jz_full = zD + self.etaU / self.p
             Kz_full = Dz_full + self.etaU
@@ -331,14 +356,68 @@ class ConvexConcaveProblemFast(object):
             Dz = Dz_full.sum(axis=-1)
             Kz = Dz + self.etaU
 
+        # --------------------------------------------------
+        # Cases 2-3: h is (N, C, K)
+        # --------------------------------------------------
         else:
-            Dh = self.D * self.h
-            z_mat = np.tile(z.flatten(), (self.D.shape[0], self.D.shape[1], 1))
-            zDh = z_mat * Dh
-            Dz = (z_mat * self.D).sum(axis=-1)
-            Jz = (zDh + self.etaU / self.p * self.h).sum(axis=-1)
-            Kz = Dz + self.etaU
-            hz = Jz / Kz
+            if self.D.ndim == 2:
+                # --------------------------------------------------
+                # Case 2:
+                # D: (N, K)
+                # h: (N, C, K)
+                #
+                # D is sample-level, so each D[i,k] is shared across
+                # all classes c.
+                # --------------------------------------------------
+
+                # zD: (N, K)
+                zD = self.D * z.reshape(1, -1)
+
+                # Dz: (N,)
+                Dz = zD.sum(axis=-1)
+
+                # Kz: (N,)
+                Kz = Dz + self.etaU
+
+                # Jz: (N, C)
+                # sum_k z_k D_ik h_ick + etaU/p * sum_k h_ick
+                Jz = (
+                             self.h * zD[:, None, :]
+                     ).sum(axis=-1) + (self.etaU / self.p) * self.h.sum(axis=-1)
+
+                # hz: (N, C)
+                hz = Jz / Kz[:, None]
+
+            elif self.D.ndim == 3:
+                # --------------------------------------------------
+                # Case 3:
+                # D: (N, C, K)
+                # h: (N, C, K)
+                #
+                # Original class-dependent density path.
+                # --------------------------------------------------
+
+                # zD: (N, C, K)
+                zD = self.D * z.reshape(1, 1, -1)
+
+                # Dz: (N, C)
+                Dz = zD.sum(axis=-1)
+
+                # Kz: (N, C)
+                Kz = Dz + self.etaU
+
+                # Jz: (N, C)
+                Jz = (
+                        zD * self.h + (self.etaU / self.p) * self.h
+                ).sum(axis=-1)
+
+                # hz: (N, C)
+                hz = Jz / Kz
+
+            else:
+                raise ValueError(
+                    f"Unexpected D shape {self.D.shape}; expected (N,K) or (N,C,K)."
+                )
 
         return Dz, Jz, Kz, hz
 
@@ -347,33 +426,66 @@ class ConvexConcaveProblemFast(object):
 
     def compute_grad_convex_fast(self, z):
         Dz, Jz, Kz, hz = self.compute_DzJzKzhz_fast(z)
-        Dh = self.D * self.h
 
-        gu = np.zeros([self.p, self.p])
+        D_for_h = self.D[:, None, :] if self.D.ndim == 2 else self.D
+        Dh = D_for_h * self.h
+
+        gu = np.zeros([self.p, self.p], dtype=self.h.dtype)
+
         for k in range(self.p):
-            a = 2 * (self.D[..., k] + self.etaU) / Kz
+            if self.D.ndim == 2:
+                Dk = self.D[:, k][:, None]  # (N, 1)
+                Kz_b = Kz[:, None]  # (N, 1)
+            else:
+                Dk = self.D[..., k]  # (N, C)
+                Kz_b = Kz  # (N, C)
+
+            a = 2 * (Dk + self.etaU) / Kz_b
+
             for i in range(self.p):
+                if self.D.ndim == 2:
+                    Di = self.D[:, i][:, None]  # (N, 1)
+                else:
+                    Di = self.D[..., i]  # (N, C)
+
                 v0 = (hz - self.y) * Dh[..., i]
-                v1 = ((hz - self.y) * hz + self.M) * self.D[..., i]
+                v1 = ((hz - self.y) * hz + self.M) * Di
+
                 gu[k, i] = (a * (v0 - v1)).sum()
 
         return np.matrix(gu)
-
 
     # compatibility alias
     compute_grad_convex = compute_grad_convex_fast
 
     def compute_grad_concave_fast(self, z):
         Dz, Jz, Kz, hz = self.compute_DzJzKzhz_fast(z)
-        Dh = self.D * self.h
 
-        gv = np.zeros([self.p, self.p])
+        D_for_h = self.D[:, None, :] if self.D.ndim == 2 else self.D
+        Dh = D_for_h * self.h
+
+        gv = np.zeros([self.p, self.p], dtype=self.h.dtype)
+
         for k in range(self.p):
             a0 = hz - self.y
-            a1 = 2 * self.M * (self.D[..., k] + self.etaU) / Kz
+
+            if self.D.ndim == 2:
+                Dk = self.D[:, k][:, None]  # (N, 1)
+                Kz_b = Kz[:, None]  # (N, 1)
+            else:
+                Dk = self.D[..., k]  # (N, C)
+                Kz_b = Kz  # (N, C)
+
+            a1 = 2 * self.M * (Dk + self.etaU) / Kz_b
             a2 = a0 ** 2 - 2 * hz * a0 - a1
+
             for i in range(self.p):
-                gv[k, i] = (a2 * self.D[..., i] + 2 * a0 * Dh[..., i]).sum()
+                if self.D.ndim == 2:
+                    Di = self.D[:, i][:, None]  # (N, 1)
+                else:
+                    Di = self.D[..., i]  # (N, C)
+
+                gv[k, i] = (a2 * Di + 2 * a0 * Dh[..., i]).sum()
 
         return np.matrix(gv)
 

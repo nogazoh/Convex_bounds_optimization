@@ -84,8 +84,8 @@ USE_ORACLE_EPSILON = False
 USE_PRECOMPUTED_D = True
 USE_ARTIFICIAL_RATIOS = True
 USE_YDH_CACHE = True
-STRICT_YDH_CACHE_ONLY = False
-BUILD_YDH_CACHE_ONLY = True
+STRICT_YDH_CACHE_ONLY = True
+BUILD_YDH_CACHE_ONLY = False
 YDH_CACHE_ROOT = "/data/nogaz/Convex_bounds_optimization/cached_YDH"
 
 RUN_TAG = f"seed_{SEED}"
@@ -101,29 +101,29 @@ FORBIDDEN_EXACT_PAIRS = {
     #
     #
     tuple(sorted(['clipart', 'infograph'])), # now running
-    tuple(sorted(['clipart', 'painting'])), # has of its own
+    # tuple(sorted(['clipart', 'painting'])), #has of its own
 
     tuple(sorted(['clipart', 'quickdraw'])),#V now running
-    tuple(sorted(['clipart', 'real'])), #has of its own
+    tuple(sorted(['clipart', 'real'])), #
 
     tuple(sorted(['clipart', 'sketch'])), #V now running
-    tuple(sorted(['infograph', 'painting'])), #has of its own
+    tuple(sorted(['infograph', 'painting'])), #
     #
     tuple(sorted(['infograph', 'quickdraw'])), #Vnow running
-    tuple(sorted(['infograph', 'real'])), #has of its own
+    tuple(sorted(['infograph', 'real'])), #
     #
     #
     tuple(sorted(['infograph', 'sketch'])), # has of its own
     #
     # #
     tuple(sorted(['painting', 'quickdraw'])), #V now running
-    tuple(sorted(['painting', 'real'])), # has of its own
+    tuple(sorted(['painting', 'real'])), #
     #
     tuple(sorted(['painting', 'sketch'])), #V ARRIVED 
     tuple(sorted(['quickdraw', 'real'])), #Vnow running
     #
     tuple(sorted(['quickdraw', 'sketch'])), #now running
-    tuple(sorted(['real', 'sketch'])), # has of its own
+    tuple(sorted(['real', 'sketch'])), #
 
 }
 
@@ -641,10 +641,8 @@ def get_train_test_loaders_and_indices(domain: str, seed: int, batch_size=32, te
         path = get_domain_path(domain)
         ds_full = datasets.ImageFolder(path)
 
-        # בדיוק אותו split כמו classifier/data.py
         train_subset, test_subset = Data.get_office31_split(ds_full, domain, seed)
 
-        # אלה indices אמיתיים לתוך הדאטה המלא, וזה מה שחשוב עבור D
         train_idx = np.array(train_subset.indices)
         test_idx = np.array(test_subset.indices)
 
@@ -876,7 +874,15 @@ def run_baselines(Y, D, H, source_domains, target_domains, all_source_domains, s
 
     def _run_single_dc_restart(i):
         try:
-            dp = init_problem_from_model_fast(Y, D, H, p=len(source_domains), C=NUM_CLASSES)
+            # D_dc = D[:, None, :] if D.ndim == 2 else D
+            D_dc = D
+            dp = init_problem_from_model_fast(
+                Y,
+                D_dc,
+                H,
+                p=len(source_domains),
+                C=NUM_CLASSES,
+            )
             slv = ConvexConcaveSolverFast(
                 ConvexConcaveProblemFast(dp),
                 seed + (i * 100),
