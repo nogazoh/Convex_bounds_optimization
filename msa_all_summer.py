@@ -27,6 +27,7 @@ from dc_fast import *
 from vae import *
 import data as Data
 import classifier as ClSFR
+import gc
 
 # --- SOLVERS ---
 try:
@@ -82,6 +83,10 @@ DATASET_MODE = "DOMAINNET"# "DIGITS"VX #"OFFICE224"VX #"OFFICE31"V DOMAINNET
 USE_ORACLE_EPSILON = False
 USE_PRECOMPUTED_D = True
 USE_ARTIFICIAL_RATIOS = True
+USE_YDH_CACHE = True
+STRICT_YDH_CACHE_ONLY = False
+BUILD_YDH_CACHE_ONLY = True
+YDH_CACHE_ROOT = "/data/nogaz/Convex_bounds_optimization/cached_YDH"
 
 RUN_TAG = f"seed_{SEED}"
 CLASSIFIERS_DIR = f"./classifiers_{RUN_TAG}"
@@ -369,6 +374,128 @@ def compute_domain_lengths(domains):
 
     return lengths
 
+def get_global_ydh_cache_path(seed):
+    """
+    One global cache file per dataset+seed.
+    It does NOT depend on target_domains or current solver source set.
+    """
+    cache_dir = os.path.join(
+        YDH_CACHE_ROOT,
+        DATASET_MODE,
+        f"seed_{seed}",
+    )
+    os.makedirs(cache_dir, exist_ok=True)
+
+    return os.path.join(cache_dir, "GLOBAL_ALL_DOMAINS.npz")
+
+
+def save_global_ydh_cache(
+    cache_path,
+    Y_all,
+    D_all,
+    H_all,
+    domain_names,
+    domain_starts,
+    domain_ends,
+    source_names,
+    seed,
+):
+    np.savez_compressed(
+        cache_path,
+        Y_all=Y_all.astype(np.float32),
+        D_all=D_all.astype(np.float32),
+        H_all=H_all.astype(np.float32),
+        domain_names=np.array(domain_names),
+        domain_starts=np.array(domain_starts, dtype=np.int64),
+        domain_ends=np.array(domain_ends, dtype=np.int64),
+        source_names=np.array(source_names),
+        seed=np.array(seed),
+        dataset_mode=np.array(DATASET_MODE),
+        num_classes=np.array(NUM_CLASSES),
+    )
+    print(f"💾 Saved GLOBAL Y/D/H cache: {cache_path}")
+
+
+def load_global_ydh_cache(cache_path):
+    data = np.load(cache_path, allow_pickle=True)
+
+    domain_names = [str(x) for x in data["domain_names"]]
+    domain_starts = data["domain_starts"].astype(np.int64)
+    domain_ends = data["domain_ends"].astype(np.int64)
+    source_names = [str(x) for x in data["source_names"]]
+
+    domain_slices = {
+        d: (int(s), int(e))
+        for d, s, e in zip(domain_names, domain_starts, domain_ends)
+    }
+
+    print(f"📦 Loaded GLOBAL Y/D/H cache: {cache_path}")
+    print(f"   Domains: {domain_slices}")
+    print(f"   Sources in cache: {source_names}")
+
+    return (
+        data["Y_all"],
+        data["D_all"],
+        data["H_all"],
+        domain_slices,
+        source_names,
+    )
+
+
+def slice_global_ydh_for_target_and_sources(
+    Y_all,
+    D_all,
+    H_all,
+    domain_slices,
+    cache_source_names,
+    target_domains,
+    solver_source_domains,
+):
+    """
+    Slice rows by target domains and columns by requested source domains.
+
+    Output order of rows follows target_domains.
+    This is important because apply_custom_ratios assumes domain blocks are concatenated
+    in the same order as target_domains.
+    """
+    ys, ds, hs = [], [], []
+
+    for d in target_domains:
+        if d not in domain_slices:
+            raise KeyError(
+                f"Domain {d} not found in global Y/D/H cache. "
+                f"Available domains: {list(domain_slices.keys())}"
+            )
+
+        start, end = domain_slices[d]
+        ys.append(Y_all[start:end])
+        ds.append(D_all[start:end])
+        hs.append(H_all[start:end])
+
+    Y_full = np.concatenate(ys, axis=0)
+    D_full = np.concatenate(ds, axis=0)
+    H_full = np.concatenate(hs, axis=0)
+
+    source_idx = []
+    for src in solver_source_domains:
+        if src not in cache_source_names:
+            raise KeyError(
+                f"Source {src} not found in global Y/D/H cache. "
+                f"Available sources: {cache_source_names}"
+            )
+        source_idx.append(cache_source_names.index(src))
+
+    if D_full.ndim == 3:
+        D_full = D_full[:, :, source_idx]
+    elif D_full.ndim == 2:
+        D_full = D_full[:, source_idx]
+    else:
+        raise ValueError(f"Unexpected D_full shape: {D_full.shape}")
+
+    H_full = H_full[:, :, source_idx]
+
+    return Y_full, D_full, H_full
+
 
 def get_domain_path(domain_name: str) -> str:
     """
@@ -633,10 +760,6 @@ def build_DP_model_Classes(data_loaders, data_size, source_domains, models, clas
 # def evaluate_accuracy(w, D, H, Y):
 #     preds = ((D * H) * w.reshape(1, 1, -1)).sum(axis=2)
 #     return accuracy_score(Y.argmax(axis=1), preds.argmax(axis=1)) * 100.0
-
-def evaluate_accuracy_wd(w, D, H, Y):
-    preds = ((D * H) * w.reshape(1, 1, -1)).sum(axis=2)
-    return accuracy_score(Y.argmax(axis=1), preds.argmax(axis=1)) * 100.0
 
 
 def evaluate_accuracy_q(Q, H, Y):
@@ -1095,26 +1218,107 @@ def build_YDH_with_precomputed_D(target_domains,source_domains, seed, classifier
             torch.cuda.empty_cache()
 
     # Expand D to (N, C, K) so evaluate_accuracy stays unchanged
-    D = np.tile(D_loaded[:, None, :], (1, C, 1))
-    return Y, D, H
+    return Y, D_loaded.astype(np.float32), H
 
+def build_global_YDH_with_precomputed_D(
+    source_domains,
+    seed,
+    classifiers,
+    Global_D,
+    domain_lengths,
+):
+    """
+    Build one global Y/D/H cache over all domains in ALL_DOMAINS_LIST.
 
-def apply_custom_ratios(Y, D, H, target_domains, custom_ratios_dict):
-    current_sizes = [TEST_SET_SIZES[d] for d in target_domains]
+    Row order:
+        all test samples from ALL_DOMAINS_LIST[0],
+        then all test samples from ALL_DOMAINS_LIST[1],
+        ...
+    """
+    Ys, Ds, Hs = [], [], []
+    domain_names = []
+    domain_starts = []
+    domain_ends = []
+
+    cursor = 0
+
+    for d in ALL_DOMAINS_LIST:
+        print(f"\n[GLOBAL CACHE] Building block for domain={d}")
+
+        Y_d, D_d, H_d = build_YDH_with_precomputed_D(
+            target_domains=[d],
+            source_domains=source_domains,
+            seed=seed,
+            classifiers=classifiers,
+            Global_D=Global_D,
+            domain_lengths=domain_lengths,
+        )
+
+        n = len(Y_d)
+
+        Ys.append(Y_d)
+        Ds.append(D_d)
+        Hs.append(H_d)
+
+        domain_names.append(d)
+        domain_starts.append(cursor)
+        domain_ends.append(cursor + n)
+
+        print(f"[GLOBAL CACHE] {d}: rows {cursor}:{cursor + n}")
+
+        cursor += n
+
+        del Y_d, D_d, H_d
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    Y_all = np.concatenate(Ys, axis=0)
+    D_all = np.concatenate(Ds, axis=0)
+    H_all = np.concatenate(Hs, axis=0)
+
+    del Ys, Ds, Hs
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    return Y_all, D_all, H_all, domain_names, domain_starts, domain_ends
+
+def apply_custom_ratios(Y, D, H, target_domains, custom_ratios_dict, domain_slices=None):
+    """
+    Subsample concatenated target-domain blocks according to custom ratios.
+
+    If domain_slices is provided, use actual block lengths from the global cache.
+    Otherwise, fall back to TEST_SET_SIZES.
+    """
+    if domain_slices is not None:
+        current_sizes = []
+        for d in target_domains:
+            start, end = domain_slices[d]
+            current_sizes.append(end - start)
+    else:
+        current_sizes = [TEST_SET_SIZES[d] for d in target_domains]
+
     requested_ratios = [custom_ratios_dict[d] for d in target_domains]
 
-    max_total_N = int(min([actual / ratio for actual, ratio in zip(current_sizes, requested_ratios)]))
+    max_total_N = int(min([
+        actual / ratio
+        for actual, ratio in zip(current_sizes, requested_ratios)
+    ]))
     max_total_N = min(max_total_N, 10000)
+
     new_indices = []
     offset = 0
+
     for i, dom in enumerate(target_domains):
         n_to_take = int(max_total_N * requested_ratios[i])
         new_indices.extend(range(offset, offset + n_to_take))
         offset += current_sizes[i]
 
-    print(f" [Subsample] Adjusting: New N={len(new_indices)} | Ratios: {requested_ratios}")
-    return Y[new_indices], D[new_indices], H[new_indices]
+    print(
+        f" [Subsample] Adjusting: New N={len(new_indices)} | "
+        f"Ratios: {requested_ratios} | Sizes: {current_sizes}"
+    )
 
+    return Y[new_indices], D[new_indices], H[new_indices]
 
 def run_solver_job_flat(
     Y, D, H,
@@ -1156,6 +1360,10 @@ def task_run(classifiers, all_source_domains):
     os.makedirs(qstar_save_dir, exist_ok=True)
 
     if USE_PRECOMPUTED_D is False:
+        if classifiers is None:
+            print("🔁 Loading classifiers because USE_PRECOMPUTED_D=False and VAE/KDE path needs them...")
+            classifiers = load_all_classifiers()
+
         models, normalize_factors, vae_norm_stats = handle_vae_models(
             all_source_domains, classifiers, seed
         )
@@ -1168,6 +1376,82 @@ def task_run(classifiers, all_source_domains):
         Global_D = load_global_D_matrix(D_PRECOMP_PATH)
         if Global_D is not None:
             domain_lengths = compute_domain_lengths(all_source_domains)
+    # -------------------------------------------------
+    # Load/build GLOBAL Y/D/H cache ONCE
+    # -------------------------------------------------
+    global_cache_path = get_global_ydh_cache_path(seed)
+
+    global_Y_all = None
+    global_D_all = None
+    global_H_all = None
+    global_domain_slices = None
+    global_cache_source_names = None
+
+    if USE_YDH_CACHE and os.path.exists(global_cache_path):
+        (
+            global_Y_all,
+            global_D_all,
+            global_H_all,
+            global_domain_slices,
+            global_cache_source_names,
+        ) = load_global_ydh_cache(global_cache_path)
+
+    else:
+        print(f"⚠️ Missing GLOBAL Y/D/H cache.")
+        print(f"Expected global cache path: {global_cache_path}")
+
+        if STRICT_YDH_CACHE_ONLY:
+            raise RuntimeError(
+                f"Missing GLOBAL Y/D/H cache and STRICT_YDH_CACHE_ONLY=True.\n"
+                f"Expected path:\n{global_cache_path}"
+            )
+
+        if classifiers is None:
+            print("🔁 Loading classifiers only because GLOBAL Y/D/H cache is missing...")
+            classifiers = load_all_classifiers()
+
+        if Global_D is None or domain_lengths is None or not USE_PRECOMPUTED_D:
+            raise RuntimeError(
+                "Global Y/D/H cache construction currently expects "
+                "USE_PRECOMPUTED_D=True with valid Global_D and domain_lengths."
+            )
+
+        (
+            global_Y_all,
+            global_D_all,
+            global_H_all,
+            domain_names,
+            domain_starts,
+            domain_ends,
+        ) = build_global_YDH_with_precomputed_D(
+            source_domains=list(all_source_domains),
+            seed=seed,
+            classifiers=classifiers,
+            Global_D=Global_D,
+            domain_lengths=domain_lengths,
+        )
+
+        save_global_ydh_cache(
+            cache_path=global_cache_path,
+            Y_all=global_Y_all,
+            D_all=global_D_all,
+            H_all=global_H_all,
+            domain_names=domain_names,
+            domain_starts=domain_starts,
+            domain_ends=domain_ends,
+            source_names=list(all_source_domains),
+            seed=seed,
+        )
+
+        global_domain_slices = {
+            d: (int(s), int(e))
+            for d, s, e in zip(domain_names, domain_starts, domain_ends)
+        }
+        global_cache_source_names = list(all_source_domains)
+
+    if BUILD_YDH_CACHE_ONLY:
+        print("✅ GLOBAL cache is ready. BUILD_YDH_CACHE_ONLY=True, so stopping before solvers.")
+        return
 
     with open(os.path.join(test_path, FILENAME), 'a') as fp:
         for target in [
@@ -1208,35 +1492,17 @@ def task_run(classifiers, all_source_domains):
             ]
 
             # -------------------------------------------------
-            # Build the full tensors ONCE per target
+            # Slice target tensors from GLOBAL Y/D/H cache
             # -------------------------------------------------
-            if Global_D is not None and domain_lengths is not None and USE_PRECOMPUTED_D:
-                Y_full, D_full, H_full = build_YDH_with_precomputed_D(
-                    target_domains=target,
-                    source_domains=solver_source_domains,
-                    seed=seed,
-                    classifiers=classifiers,
-                    Global_D=Global_D,
-                    domain_lengths=domain_lengths,
-                )
-            else:
-                el = []
-                for d in target:
-                    _, l, _ = Data.get_data_loaders(d, seed=seed)
-                    el.append((d, l))
-
-                Y_full, D_full, H_full = build_DP_model_Classes(
-                    el,
-                    sum(len(l.dataset) for _, l in el),
-                    solver_source_domains,
-                    models,
-                    classifiers,
-                    normalize_factors,
-                    vae_norm_stats,
-                )
-
-                del el
-                gc.collect()
+            Y_full, D_full, H_full = slice_global_ydh_for_target_and_sources(
+                Y_all=global_Y_all,
+                D_all=global_D_all,
+                H_all=global_H_all,
+                domain_slices=global_domain_slices,
+                cache_source_names=global_cache_source_names,
+                target_domains=target,
+                solver_source_domains=solver_source_domains,
+            )
 
             torch.cuda.empty_cache()
             gc.collect()
@@ -1254,7 +1520,12 @@ def task_run(classifiers, all_source_domains):
                 strategy_order.append(strategy_name)
 
                 Y, D, H = apply_custom_ratios(
-                    Y_full, D_full, H_full, target, custom_ratios
+                    Y_full,
+                    D_full,
+                    H_full,
+                    target,
+                    custom_ratios,
+                    domain_slices=global_domain_slices,
                 )
 
                 true_r_weights = np.array([
@@ -1416,26 +1687,14 @@ def get_actual_test_set_sizes(domains):
             actual_sizes[d] = 0
     return actual_sizes
 
-
-def main():
-    print(f"Starting Main Process | Dataset Mode: {DATASET_MODE}")
+def load_all_classifiers():
     classifiers = {}
+
     n_gpus = torch.cuda.device_count()
     if n_gpus > 1:
         print(f"🚀 Detected {n_gpus} GPUs! Enabling DataParallel for feature extraction.")
-    # for d in ALL_DOMAINS_LIST:
-    #     # Check for both naming conventions in the consolidated ./classifiers folder
-    #     p1 = f"./classifiers/{d}_224.pt"
-    #     p2 = f"./classifiers/{d}_classifier.pt"
-    #     path = p1 if os.path.exists(p1) else p2
-    #
-    #     if not os.path.exists(path):
-    #         print(f"❌ Warning: Classifier for {d} not found in ./classifiers/")
-    #         continue
-    for d in ALL_DOMAINS_LIST:
-        # Load classifiers from the seed-specific directory.
-        # Example: ./classifiers_seed_101/amazon_224.pt
 
+    for d in ALL_DOMAINS_LIST:
         p1 = os.path.join(CLASSIFIERS_DIR, f"{d}_224.pt")
         p2 = os.path.join(CLASSIFIERS_DIR, f"{d}_classifier.pt")
         path = p1 if os.path.exists(p1) else p2
@@ -1454,6 +1713,7 @@ def main():
                 m = nn.DataParallel(m)
             m = m.to(device).eval()
             classifiers[d] = m
+
         else:
             m = models.resnet50(weights=None)
             m.fc = nn.Linear(m.fc.in_features, NUM_CLASSES)
@@ -1462,6 +1722,7 @@ def main():
             if n_gpus > 1:
                 extractor = nn.DataParallel(extractor)
             classifiers[d] = extractor.to(device).eval()
+
         print(f"✅ Loaded Classifier: {d}")
 
     missing = [d for d in ALL_DOMAINS_LIST if d not in classifiers]
@@ -1471,8 +1732,15 @@ def main():
             f"Do not run MSA with partial classifiers."
         )
 
-    task_run(classifiers, ALL_DOMAINS_LIST)
+    return classifiers
 
+def main():
+    print(f"Starting Main Process | Dataset Mode: {DATASET_MODE}")
+
+    # Do NOT load classifiers here.
+    # task_run will first try loading Y/D/H cache.
+    # classifiers will be loaded lazily only if a cache file is missing.
+    task_run(classifiers=None, all_source_domains=ALL_DOMAINS_LIST)
 
 
 #--------------------------------------------
