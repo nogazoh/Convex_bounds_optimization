@@ -43,6 +43,9 @@ from cvxpy_3_23 import solve_convex_problem_smoothed_original_p
 from cvxpy_3_31 import solve_convex_problem_smoothed_kl_331
 from cvxpy_3_32 import solve_convex_problem_domain_anchored_smoothed_332
 from cvxpy_3_33 import solve_convex_problem_smoothed_original_p_333
+from cvxpy_6 import solve_convex_problem_soft_kl_diagonal_fast
+from cvxpy_6a import solve_convex_problem_soft_kl_diagonal_fast_6A
+from cvxpy_6b import solve_convex_problem_soft_kl_diagonal_fast_6B
 
 from helpers import *
 from loss_functions import (
@@ -61,35 +64,61 @@ torch.set_num_threads(1)
 # ==========================================
 # --- CONFIGURATION ---
 # ==========================================
-CONSTRAINT_LOSS_TYPE = "ce"   # options: "01", "ce"
+SEED = 1
+# SEED = 101
+# SEED = 201
+# SEED = 301
+# SEED = 401
+CONSTRAINT_LOSS_TYPE = "01"   # options: "01", "ce"
 if CONSTRAINT_LOSS_TYPE == "01":
     EVAL_METRIC = "accuracy"
 else:
     EVAL_METRIC = "ce"
 # options: "accuracy", "error", "ce"
-FILENAME = f'Sweep_Results_{CONSTRAINT_LOSS_TYPE}_eta_grid.txt'
-DATASET_MODE = "OFFICE31"# "DIGITS"VX #"OFFICE224"VX #"OFFICE31"V DOMAINNET
-USE_ORACLE_EPSILON = True
+USE_ALL_SOURCES_FOR_SOLVER = True
+# FILENAME = f'Sweep_Results_{CONSTRAINT_LOSS_TYPE}_6_grid_all_sources_base_couples.txt'
+FILENAME = f'Sweep_Results_{CONSTRAINT_LOSS_TYPE}_seed_{SEED}_6_grid_all_sources_{USE_ALL_SOURCES_FOR_SOLVER}.txt'
+DATASET_MODE = "DOMAINNET"# "DIGITS"VX #"OFFICE224"VX #"OFFICE31"V DOMAINNET
+USE_ORACLE_EPSILON = False
 USE_PRECOMPUTED_D = True
 USE_ARTIFICIAL_RATIOS = True
 
-
+RUN_TAG = f"seed_{SEED}"
+CLASSIFIERS_DIR = f"./classifiers_{RUN_TAG}"
+if DATASET_MODE == "DOMAINNET":
+    CLASSIFIERS_DIR = "/data/nogaz/Convex_bounds_optimization/classifiers"
+else:
+    CLASSIFIERS_DIR = f"./classifiers_{RUN_TAG}"
 FORBIDDEN_EXACT_PAIRS = {
-    tuple(sorted(['clipart', 'infograph'])), #V
-    tuple(sorted(['clipart', 'painting'])), #V
-    tuple(sorted(['clipart', 'quickdraw'])),#V
-    tuple(sorted(['clipart', 'real'])), #V
-    tuple(sorted(['clipart', 'sketch'])), #V
-    tuple(sorted(['infograph', 'painting'])), #V
-    tuple(sorted(['infograph', 'quickdraw'])), #V
-    tuple(sorted(['infograph', 'real'])), #V
-    tuple(sorted(['infograph', 'sketch'])), #V
-    tuple(sorted(['painting', 'quickdraw'])), #V
-    tuple(sorted(['painting', 'real'])), #V
-    tuple(sorted(['painting', 'sketch'])), #V
-    tuple(sorted(['quickdraw', 'real'])), #V
-    tuple(sorted(['quickdraw', 'sketch'])), #V
-    tuple(sorted(['real', 'sketch'])), #V
+    # tuple(sorted(['Art', 'Clipart'])),
+    # tuple(sorted(['Art', 'Product'])),
+    #
+    #
+    #
+    tuple(sorted(['clipart', 'infograph'])), # now running
+    tuple(sorted(['clipart', 'painting'])), # has of its own
+
+    tuple(sorted(['clipart', 'quickdraw'])),#V now running
+    tuple(sorted(['clipart', 'real'])), #has of its own
+
+    tuple(sorted(['clipart', 'sketch'])), #V now running
+    tuple(sorted(['infograph', 'painting'])), #has of its own
+    #
+    tuple(sorted(['infograph', 'quickdraw'])), #Vnow running
+    tuple(sorted(['infograph', 'real'])), #has of its own
+    #
+    #
+    tuple(sorted(['infograph', 'sketch'])), # has of its own
+    #
+    # #
+    tuple(sorted(['painting', 'quickdraw'])), #V now running
+    tuple(sorted(['painting', 'real'])), # has of its own
+    #
+    tuple(sorted(['painting', 'sketch'])), #V ARRIVED 
+    tuple(sorted(['quickdraw', 'real'])), #Vnow running
+    #
+    tuple(sorted(['quickdraw', 'sketch'])), #now running
+    tuple(sorted(['real', 'sketch'])), # has of its own
 
 }
 
@@ -117,7 +146,7 @@ CONFIGS = {
         "INPUT_DIM": 2048,
         "SOURCE_LOSSES_01": {'amazon': 0.02855, 'dslr': 1e-05, 'webcam': 0.00018},
         "SOURCE_LOSSES_CR_ENT": {'amazon': 0.07293, 'dslr': 0.13897, 'webcam': 0.02134},
-        "TEST_SET_SIZES": {'amazon': 564, 'dslr': 100, 'webcam': 159},
+        "TEST_SET_SIZES": {'amazon': 2197, 'dslr': 281, 'webcam': 578},
         "D_PRECOMP_PATH":"/data/nogaz/Convex_bounds_optimization/LatentFlow_Pixel_Experiments/results/D_Matrix_FINAL_GMM_Soft.npy"
     },
     "DOMAINNET": {
@@ -438,9 +467,14 @@ def evaluate_preds_with_metric(preds, Y, metric):
 
     raise ValueError(f"Unsupported metric='{metric}'")
 
-def get_train_test_loaders_and_indices(domain: str, seed: int, batch_size=64, test_batch_size=64):
+def get_train_test_loaders_and_indices(domain: str, seed: int, batch_size=32, test_batch_size=16):
     if DATASET_MODE == 'DIGITS':
-        train_loader, test_loader, _ = Data.get_data_loaders(domain, seed=seed, batch_size=batch_size)
+        train_loader, test_loader, _ = Data.get_data_loaders(
+            domain,
+            seed=seed,
+            batch_size=batch_size,
+            test_batch_size=test_batch_size,
+        )
         n_train = len(train_loader.dataset)
         n_test = len(test_loader.dataset)
         return (
@@ -476,6 +510,23 @@ def get_train_test_loaders_and_indices(domain: str, seed: int, batch_size=64, te
         train_idx = np.arange(0, n_train)
         test_idx = np.arange(n_train, n_train + n_test)
 
+    elif DATASET_MODE == "OFFICE31":
+        path = get_domain_path(domain)
+        ds_full = datasets.ImageFolder(path)
+
+        # בדיוק אותו split כמו classifier/data.py
+        train_subset, test_subset = Data.get_office31_split(ds_full, domain, seed)
+
+        # אלה indices אמיתיים לתוך הדאטה המלא, וזה מה שחשוב עבור D
+        train_idx = np.array(train_subset.indices)
+        test_idx = np.array(test_subset.indices)
+
+        train_ds = TransformedSubset(train_subset, train_trans)
+        test_ds = TransformedSubset(test_subset, test_trans)
+
+        n_train = len(train_ds)
+        n_test = len(test_ds)
+
     else:
         path = get_domain_path(domain)
         ds_full = datasets.ImageFolder(path)
@@ -509,7 +560,7 @@ def get_train_test_loaders_and_indices(domain: str, seed: int, batch_size=64, te
         pin_memory=(Data.device.type == "cuda") if DATASET_MODE == "DOMAINNET" else True,
     )
 
-    return train_loader, test_loader, train_idx, test_idx, n_train + n_test
+    return train_loader, test_loader, train_idx, test_idx, len(ds_full) if DATASET_MODE == "OFFICE31" else (n_train + n_test)
 
 # ==========================================
 # --- Core matrix builder (KDE path) ---
@@ -642,39 +693,22 @@ def run_baselines(Y, D, H, source_domains, target_domains, all_source_domains, s
     print("uniform_ce direct:", evaluate_solution_with_w(uniform_w, D, H, Y, metric="ce"))
     print("oracle_ce direct:", evaluate_solution_with_w(true_r_weights, D, H, Y, metric="ce"))
 
-    # --- 2. Best Single Source ---
-    best_single_score = None
-    best_source_name = ""
-    best_source_idx = -1
-
+    # --- 2. Per-Source Expert Performance on Current Target ---
     for k, src_name in enumerate(source_domains):
-        src_preds = H[:, :, k]   # (N, C)
+        src_preds = H[:, :, k]  # (N, C)
         src_score = evaluate_preds_with_metric(src_preds, Y, EVAL_METRIC)
 
-        if best_single_score is None:
-            best_single_score = src_score
-            best_source_name = src_name
-            best_source_idx = k
-        else:
-            if EVAL_METRIC == "accuracy":
-                is_better = src_score > best_single_score
-            else:
-                is_better = src_score < best_single_score
+        w_single = np.zeros(len(source_domains))
+        w_single[k] = 1.0
+        w_f_single = map_weights_to_full_source_list(
+            w_single, source_domains, all_source_domains
+        )
 
-            if is_better:
-                best_single_score = src_score
-                best_source_name = src_name
-                best_source_idx = k
-
-    w_best_single = np.zeros(len(source_domains))
-    w_best_single[best_source_idx] = 1.0
-    w_f_best = map_weights_to_full_source_list(w_best_single, source_domains, all_source_domains)
-
-    buf.write(
-        f"{'BEST_SINGLE_SRC':<18} | {best_source_name:<15} | {'N/A':<15} | "
-        f"{best_single_score:<12.2f} | {str(np.round(w_f_best, 4))}\n"
-    )
-    print(f" >>> [Baseline] BEST_SINGLE_SRC ({best_source_name}) | {metric_label}: {best_single_score:.2f}")
+        buf.write(
+            f"{('SRC_' + src_name):<18} | {src_name:<15} | {'N/A':<15} | "
+            f"{src_score:<12.2f} | {str(np.round(w_f_single, 4))}\n"
+        )
+        print(f" >>> [Baseline] SRC_{src_name} | {metric_label}: {src_score:.2f}")
 
     # --- 3. Oracle Any Correct / CE Lower Bound ---
     y_true = Y.argmax(axis=1)
@@ -714,35 +748,49 @@ def run_baselines(Y, D, H, source_domains, target_domains, all_source_domains, s
 
     # --- 4. DC Solver ---
     print(" [Baseline] Running DC Solver...")
-    dc_scores, best_z_dc = [], None
-    best_dc_score = None
 
-    for i in range(5):
+    DC_NUM_JOBS = 2  # start conservatively; do not jump to 5
+
+    def _run_single_dc_restart(i):
         try:
             dp = init_problem_from_model_fast(Y, D, H, p=len(source_domains), C=NUM_CLASSES)
-            slv = ConvexConcaveSolverFast(ConvexConcaveProblemFast(dp), seed + (i * 100), "err")
+            slv = ConvexConcaveSolverFast(
+                ConvexConcaveProblemFast(dp),
+                seed + (i * 100),
+                "err"
+            )
             z_dc, _, _ = slv.solve()
 
-            if z_dc is not None:
-                score = evaluate_solution_with_w(z_dc, D, H, Y, metric=EVAL_METRIC)
-                dc_scores.append(score)
+            if z_dc is None:
+                return None
 
-                if best_dc_score is None:
-                    best_dc_score = score
-                    best_z_dc = z_dc
-                else:
-                    if EVAL_METRIC == "accuracy":
-                        is_better = score > best_dc_score
-                    else:
-                        is_better = score < best_dc_score
+            score = evaluate_solution_with_w(z_dc, D, H, Y, metric=EVAL_METRIC)
+            return {
+                "seed_idx": i,
+                "score": score,
+                "z": z_dc,
+            }
 
-                    if is_better:
-                        best_dc_score = score
-                        best_z_dc = z_dc
-        except:
-            continue
+        except Exception:
+            return None
 
-    if dc_scores:
+    dc_results = Parallel(n_jobs=DC_NUM_JOBS, backend="loky")(
+        delayed(_run_single_dc_restart)(i) for i in range(4)
+    )
+
+    dc_results = [r for r in dc_results if r is not None]
+
+    if dc_results:
+        dc_scores = [r["score"] for r in dc_results]
+
+        if EVAL_METRIC == "accuracy":
+            best_result = max(dc_results, key=lambda r: r["score"])
+        else:
+            best_result = min(dc_results, key=lambda r: r["score"])
+
+        best_dc_score = best_result["score"]
+        best_z_dc = best_result["z"]
+
         avg_res = f"{np.mean(dc_scores):.2f}±{np.std(dc_scores):.2f}"
         w_f = map_weights_to_full_source_list(best_z_dc, source_domains, all_source_domains)
         buf.write(
@@ -752,13 +800,11 @@ def run_baselines(Y, D, H, source_domains, target_domains, all_source_domains, s
 
     return buf.getvalue(), oracle_epsilon
 
-# from cvxpy_3_21 import solve_convex_problem_smoothed_kl_321
-# from cvxpy_3_22 import solve_convex_problem_domain_anchored_smoothed
-# from cvxpy_3_23 import solve_convex_problem_smoothed_original_p
 
 
-def run_solver_sweep_worker(Y, D, H, eps_mult, source_domains, all_source_domains, save_dir,
-    strategy_name=None, target_domains=None, true_r_weights=None,oracle_epsilon=None,
+def run_solver_sweep_worker(
+    Y, D, H, eps_mult, source_domains, all_source_domains, save_dir,
+    strategy_name=None, target_domains=None, true_r_weights=None, oracle_epsilon=None,
 ):
     print(f" [Worker] Starting sweep for Epsilon Mult: {eps_mult}")
     buf = io.StringIO()
@@ -784,18 +830,29 @@ def run_solver_sweep_worker(Y, D, H, eps_mult, source_domains, all_source_domain
 
     max_ent = np.log(len(source_domains)) if len(source_domains) > 1 else 0.1
 
-    SOLVERS = ["CVXPY_GLOBAL", "3.31","3.32", "3.33"] # "3.32", "3.21", "3.22", "3.23", "CVXPY_GLOBAL",
-    BACKENDS = ["SCS"]# , "MOSEK"]   # <- run both
-    ETAS = [1e-8, 1e-4, 1e-1, 1.0]# [1.2]#, 1.2]
-    mult = 1.2
-    for solver in SOLVERS:
-        for eta in ETAS:
-            delta = mult * max_ent
+    SOLVERS = ["PER_DOMAIN", "6", "6A"] # "CVXPY_GLOBAL",, "3.32" "3.31" "6B",  "3.33","3.31"
+    BACKENDS = ["SCS"]
+    ETAS = [1e-3, 1e-1, 1.0]
+    BETAS = [1e-3, 1e-1, 1.0]
+    DELTA_MULTS = [0.05, 0.5, 1.0]
+
+    metric_label = {
+        "accuracy": "acc",
+        "error": "err",
+        "ce": "ce",
+    }[EVAL_METRIC]
+
+    # =========================================================
+    # Solvers that depend on DELTA
+    # =========================================================
+    delta_solvers = [s for s in SOLVERS if s in ["CVXPY_GLOBAL", "PER_DOMAIN"]]
+
+    for solver in delta_solvers:
+        for delta_mult in DELTA_MULTS:
+            delta = float(delta_mult * max_ent)
+
             for backend in BACKENDS:
                 try:
-                    # ----------------------------
-                    # solve
-                    # ----------------------------
                     if solver == "CVXPY_GLOBAL":
                         w, Q = solve_convex_problem_mosek(
                             Y, D, H,
@@ -804,118 +861,178 @@ def run_solver_sweep_worker(Y, D, H, eps_mult, source_domains, all_source_domain
                             solver_type=backend,
                             loss_type=CONSTRAINT_LOSS_TYPE,
                         )
-                    # elif solver == "3.21":
-                    #     w, Q = solve_convex_problem_smoothed_kl_321(
-                    #         Y, D, H,
-                    #         epsilon=float(epsilon_used),
-                    #         solver_type=backend
-                    #     )
-                    # elif solver == "3.22":
-                    #     w, Q = solve_convex_problem_domain_anchored_smoothed(
-                    #         Y, D, H,
-                    #         epsilon=float(epsilon_used),
-                    #         solver_type=backend
-                    #     )
-                    # elif solver == "3.23":
-                    #     w, Q = solve_convex_problem_smoothed_original_p(
-                    #         Y, D, H,
-                    #         epsilon=float(epsilon_used),
-                    #         solver_type=backend
-                    #     )
-                    elif solver == "3.31":
-                        w, Q = solve_convex_problem_smoothed_kl_331(
-                            Y, D, H,
-                            epsilon=float(epsilon_used),
-                            eta=eta,
-                            solver_type=backend,
-                            loss_type=CONSTRAINT_LOSS_TYPE,
 
-                        )
-                    elif solver == "3.32":
-                        w, Q = solve_convex_problem_domain_anchored_smoothed_332(
+                    elif solver == "PER_DOMAIN":
+                        w, Q = solve_convex_problem_per_domain(
                             Y, D, H,
-                            epsilon=float(epsilon_used),
-                            eta=eta,
-                            solver_type=backend,
-                            loss_type=CONSTRAINT_LOSS_TYPE,
-                        )
-                    elif solver == "3.33":
-                        w, Q = solve_convex_problem_smoothed_original_p_333(
-                            Y, D, H,
-                            epsilon=float(epsilon_used),
-                            eta=eta,
+                            delta=np.full(len(source_domains), delta),
+                            epsilon=epsilon_used,
                             solver_type=backend,
                             loss_type=CONSTRAINT_LOSS_TYPE,
                         )
 
                     else:
-                        w, Q = solve_convex_problem_per_domain(
-                            Y, D, H,
-                            delta=np.full(len(source_domains), delta),
-                            epsilon=errors,
-                            solver_type=backend
-                        )
-
-                    if w is None or Q is None:
-                        buf.write(f"[{solver}/{backend}] Returned None (likely infeasible)\n")
                         continue
 
-                    # save_qstar_artifact(
-                    #     base_dir=save_dir, Q=Q, w=w, Y=Y,
-                    #     source_domains=source_domains,
-                    #     all_source_domains=all_source_domains, solver=solver, backend=backend, eps_mult=eps_mult,
-                    #     delta_mult=mult, dataset_mode=DATASET_MODE, strategy_name=strategy_name,
-                    #     target_domains=target_domains if target_domains is not None else source_domains,
-                    #     true_r_weights=true_r_weights,
-                    #     extra_info={
-                    #         "errors": errors.tolist(),
-                    #         "max_entropy": float(max_ent),
-                    #         "epsilon_used": float(np.max(errors)),
-                    #     },
-                    # )
-                    # ----------------------------
-                    # evaluate (same code path!)
-                    # ----------------------------
+                    if w is None or Q is None:
+                        buf.write(
+                            f"[{solver}/{backend}] Returned None (likely infeasible) "
+                            f"| delta_mult={delta_mult} | delta={delta:.6f}\n"
+                        )
+                        continue
+
                     score_w = evaluate_solution_with_w(w, D, H, Y, metric=EVAL_METRIC)
                     score_q = evaluate_solution_with_q(Q, H, Y, metric=EVAL_METRIC)
-
                     w_f = map_weights_to_full_source_list(w, source_domains, all_source_domains)
 
-                    # print with backend explicitly + full precision weights (optional)
-                    metric_label = {
-                        "accuracy": "acc",
-                        "error": "err",
-                        "ce": "ce",
-                    }[EVAL_METRIC]
-
-                    # if solver == "3.33":
-                    #     print("SOLVER DEBUG")
-                    #     print("w local:", w)
-                    #     print("solver_ce direct:", evaluate_solution_with_w(w, D, H, Y, metric="ce"))
-                    #     print("uniform_ce same place:",
-                    #           evaluate_solution_with_w(np.ones(len(source_domains)) / len(source_domains), D, H, Y,
-                    #                                    metric="ce"))
-
                     buf.write(
-                        f"{solver:<12} | {backend:<5} | m:{eps_mult:<4} | eta:{eta:<3} "
+                        f"{solver:<12} | {backend:<5} | m:{eps_mult:<4} "
+                        f"| delta_mult:{delta_mult:<5} | delta:{delta:<8.6f} "
                         f"| {metric_label}_W: {score_w:>6.2f} | {metric_label}_Q: {score_q:>6.2f} "
                         f"| W: {np.array2string(w_f, precision=6)}\n"
                     )
 
                 except Exception as e:
                     tb = traceback.format_exc()
-                    msg = f"[{solver}/{backend}] ERROR eps_mult={eps_mult} eta={eta}: {repr(e)}\n{tb}\n"
+                    msg = (
+                        f"[{solver}/{backend}] ERROR eps_mult={eps_mult} "
+                        f"delta_mult={delta_mult} delta={delta:.6f}: {repr(e)}\n{tb}\n"
+                    )
                     print(msg)
                     buf.write(msg)
 
-    return buf.getvalue()
+    # =========================================================
+    # Solvers that depend on ETA
+    # =========================================================
+    eta_solver_map = {
+        "3.31": solve_convex_problem_smoothed_kl_331,
+        "3.32": solve_convex_problem_domain_anchored_smoothed_332,
+        "3.33": solve_convex_problem_smoothed_original_p_333,
+        "6": solve_convex_problem_soft_kl_diagonal_fast,
+        "6A": solve_convex_problem_soft_kl_diagonal_fast_6A,
+        "6B": solve_convex_problem_soft_kl_diagonal_fast_6B,
+    }
 
+    eta_solvers = [s for s in SOLVERS if s in eta_solver_map]
+    beta_solvers = {"6", "6A", "6B"}
+
+    for solver in eta_solvers:
+        solver_fn = eta_solver_map[solver]
+
+        for eta in ETAS:
+            for backend in BACKENDS:
+                # -----------------------------------------
+                # solvers with both eta and beta sweeps
+                # -----------------------------------------
+                if solver in beta_solvers:
+                    for beta in BETAS:
+                        try:
+                            out = solver_fn(
+                                Y, D, H,
+                                epsilon=float(epsilon_used),
+                                eta=eta,
+                                beta=beta,
+                                solver_type=backend,
+                                loss_type=CONSTRAINT_LOSS_TYPE,
+                            )
+
+                            if solver == "6A":
+                                w, Q, R, s_val = out
+                                if w is None or Q is None or R is None:
+                                    msg = (
+                                        f"[{solver}/{backend}] Returned None (likely infeasible) "
+                                        f"| eps_mult={eps_mult} | eta={eta} | beta={beta}\n"
+                                    )
+                                    print(msg, end="")
+                                    buf.write(msg)
+                                    continue
+                            else:
+                                w, Q, R = out
+                                s_val = None
+                                if w is None or Q is None or R is None:
+                                    msg = (
+                                        f"[{solver}/{backend}] Returned None (likely infeasible) "
+                                        f"| eps_mult={eps_mult} | eta={eta} | beta={beta}\n"
+                                    )
+                                    print(msg, end="")
+                                    buf.write(msg)
+                                    continue
+
+                            score_w = evaluate_solution_with_w(w, D, H, Y, metric=EVAL_METRIC)
+                            score_q = evaluate_solution_with_q(Q, H, Y, metric=EVAL_METRIC)
+                            w_f = map_weights_to_full_source_list(w, source_domains, all_source_domains)
+
+                            extra = f" | s:{s_val:.6f}" if s_val is not None else ""
+                            msg = (
+                                f"{solver:<12} | {backend:<5} | m:{eps_mult:<4} "
+                                f"| eta:{eta:<8} | beta:{beta:<8} "
+                                f"| {metric_label}_W: {score_w:>6.2f} | {metric_label}_Q: {score_q:>6.2f}"
+                                f"{extra} | W: {np.array2string(w_f, precision=6)}\n"
+                            )
+                            print(msg, end="")
+                            buf.write(msg)
+
+                        except Exception as e:
+                            tb = traceback.format_exc()
+                            msg = (
+                                f"[{solver}/{backend}] ERROR "
+                                f"eps_mult={eps_mult} eta={eta} beta={beta}: "
+                                f"{repr(e)}\n{tb}\n"
+                            )
+                            print(msg, end="")
+                            buf.write(msg)
+
+                # -----------------------------------------
+                # solvers with eta only
+                # -----------------------------------------
+                else:
+                    try:
+                        w, Q = solver_fn(
+                            Y, D, H,
+                            epsilon=float(epsilon_used),
+                            eta=eta,
+                            solver_type=backend,
+                            loss_type=CONSTRAINT_LOSS_TYPE,
+                        )
+
+                        if w is None or Q is None:
+                            msg = (
+                                f"[{solver}/{backend}] Returned None (likely infeasible) "
+                                f"| eps_mult={eps_mult} | eta={eta}\n"
+                            )
+                            print(msg, end="")
+                            buf.write(msg)
+                            continue
+
+                        score_w = evaluate_solution_with_w(w, D, H, Y, metric=EVAL_METRIC)
+                        score_q = evaluate_solution_with_q(Q, H, Y, metric=EVAL_METRIC)
+                        w_f = map_weights_to_full_source_list(w, source_domains, all_source_domains)
+
+                        msg = (
+                            f"{solver:<12} | {backend:<5} | m:{eps_mult:<4} | eta:{eta:<8} "
+                            f"| {metric_label}_W: {score_w:>6.2f} | {metric_label}_Q: {score_q:>6.2f} "
+                            f"| W: {np.array2string(w_f, precision=6)}\n"
+                        )
+                        print(msg, end="")
+                        buf.write(msg)
+
+                    except Exception as e:
+                        tb = traceback.format_exc()
+                        msg = (
+                            f"[{solver}/{backend}] ERROR "
+                            f"eps_mult={eps_mult} eta={eta}: "
+                            f"{repr(e)}\n{tb}\n"
+                        )
+                        print(msg, end="")
+                        buf.write(msg)
+
+    return buf.getvalue()
 
 # ============================================================
 # --- NEW: Build Y,H using precomputed D (no KDE) ---
 # ============================================================
 
-def build_YDH_with_precomputed_D(target_domains, seed, classifiers,
+def build_YDH_with_precomputed_D(target_domains,source_domains, seed, classifiers,
                                  Global_D, domain_lengths):
     """
     Build Y, H from loaders (deterministic ordered test split),
@@ -923,7 +1040,7 @@ def build_YDH_with_precomputed_D(target_domains, seed, classifiers,
     then expand to (N, C, K) to match downstream code.
     """
     C = NUM_CLASSES
-    K = len(target_domains)
+    K = len(source_domains)
 
     # Build ordered test loaders per domain (like the other file)
     loaders = []
@@ -944,7 +1061,8 @@ def build_YDH_with_precomputed_D(target_domains, seed, classifiers,
         D_dom_full = slice_global_D_for_domain(Global_D, ALL_DOMAINS_LIST, domain_lengths, dom_name)
 
         # Select columns for active K domains, in the same order as target_domains
-        col_idx = [ALL_DOMAINS_LIST.index(s) for s in target_domains]
+        # col_idx = [ALL_DOMAINS_LIST.index(s) for s in target_domains]
+        col_idx = [ALL_DOMAINS_LIST.index(s) for s in source_domains]
         D_dom_full = D_dom_full[:, col_idx]
 
         # Slice by the same indices used by the loader (test split indices)
@@ -962,7 +1080,8 @@ def build_YDH_with_precomputed_D(target_domains, seed, classifiers,
             Y[i:i + N] = one_hot
 
             with torch.no_grad():
-                for k, src in enumerate(target_domains):
+                # for k, src in enumerate(target_domains):
+                for k, src in enumerate(source_domains):
                     if DATASET_MODE == 'DIGITS':
                         logits = classifiers[src](data)
                     else:
@@ -996,8 +1115,36 @@ def apply_custom_ratios(Y, D, H, target_domains, custom_ratios_dict):
     print(f" [Subsample] Adjusting: New N={len(new_indices)} | Ratios: {requested_ratios}")
     return Y[new_indices], D[new_indices], H[new_indices]
 
+
+def run_solver_job_flat(
+    Y, D, H,
+    eps_mult,
+    source_domains,
+    all_source_domains,
+    qstar_save_dir,
+    strategy_name,
+    true_r_weights,
+    oracle_epsilon,
+):
+    result_text = run_solver_sweep_worker(
+        Y=Y,
+        D=D,
+        H=H,
+        eps_mult=eps_mult,
+        source_domains=source_domains,
+        all_source_domains=all_source_domains,
+        save_dir=qstar_save_dir,
+        strategy_name=strategy_name,
+        target_domains=None,
+        true_r_weights=true_r_weights,
+        oracle_epsilon=oracle_epsilon,
+    )
+    return strategy_name, eps_mult, result_text
+
+
 def task_run(classifiers, all_source_domains):
-    seed = 1
+    # seed = 1
+    seed = SEED
     torch.manual_seed(seed)
     np.random.seed(seed)
     import gc
@@ -1009,7 +1156,11 @@ def task_run(classifiers, all_source_domains):
     os.makedirs(qstar_save_dir, exist_ok=True)
 
     if USE_PRECOMPUTED_D is False:
-        models, normalize_factors, vae_norm_stats = handle_vae_models(all_source_domains, classifiers, seed)
+        models, normalize_factors, vae_norm_stats = handle_vae_models(
+            all_source_domains, classifiers, seed
+        )
+    else:
+        models, normalize_factors, vae_norm_stats = None, None, None
 
     Global_D = None
     domain_lengths = None
@@ -1018,15 +1169,13 @@ def task_run(classifiers, all_source_domains):
         if Global_D is not None:
             domain_lengths = compute_domain_lengths(all_source_domains)
 
-    # filename = f'Sweep_Results_{seed}_ce.txt'
-
     with open(os.path.join(test_path, FILENAME), 'a') as fp:
-        for target in [list(s) for r in range(2, len(all_source_domains) + 1) for s in
-                       itertools.combinations(all_source_domains, r)]:
-
+        for target in [
+            list(s)
+            for r in range(2,len(all_source_domains) + 1)
+            for s in itertools.combinations(all_source_domains, r)
+        ]:
             target_tuple = tuple(sorted(target))
-            # if target_tuple != tuple(sorted(["amazon", "webcam"])):
-            #     continue
 
             if target_tuple in FORBIDDEN_EXACT_PAIRS:
                 print(f"⏭️ Skipping exact forbidden pair: {target}")
@@ -1038,6 +1187,11 @@ def task_run(classifiers, all_source_domains):
 
             print(f"\n[TARGET] Processing: {target}")
 
+            if USE_ALL_SOURCES_FOR_SOLVER:
+                solver_source_domains = list(all_source_domains)
+            else:
+                solver_source_domains = list(target)
+
             set1 = TARGET_RATIOS_CONFIG[target_tuple]
 
             keys = list(set1.keys())
@@ -1045,101 +1199,163 @@ def task_run(classifiers, all_source_domains):
             inv_vals = (1.0 / (vals + 1e-6))
             inv_vals /= inv_vals.sum()
             set2 = {keys[i]: inv_vals[i] for i in range(len(keys))}
-
             set3 = {d: 1.0 / len(target) for d in target}
 
             weight_sets = [
                 ("CONFIG_ORIGINAL", set1),
-                ("CONFIG_INVERSE", set2),
-                ("UNIFORM", set3)
+                # ("CONFIG_INVERSE", set2),
+                ("UNIFORM", set3),
             ]
 
+            # -------------------------------------------------
+            # Build the full tensors ONCE per target
+            # -------------------------------------------------
             if Global_D is not None and domain_lengths is not None and USE_PRECOMPUTED_D:
                 Y_full, D_full, H_full = build_YDH_with_precomputed_D(
-                    target_domains=target, seed=seed, classifiers=classifiers,
-                    Global_D=Global_D, domain_lengths=domain_lengths
+                    target_domains=target,
+                    source_domains=solver_source_domains,
+                    seed=seed,
+                    classifiers=classifiers,
+                    Global_D=Global_D,
+                    domain_lengths=domain_lengths,
                 )
             else:
                 el = []
                 for d in target:
                     _, l, _ = Data.get_data_loaders(d, seed=seed)
                     el.append((d, l))
-                Y_full, D_full, H_full = build_DP_model_Classes(el, sum(len(l.dataset) for _, l in el),
-                                                                target, models, classifiers,
-                                                                normalize_factors, vae_norm_stats)
 
-            torch.cuda.empty_cache()
-            gc.collect()
-
-            for strategy_name, custom_ratios in weight_sets:
-                # if strategy_name != "CONFIG_INVERSE": # TODO DELETE
-                #     continue
-                print(f"  -> Strategy: {strategy_name} | {custom_ratios}")
-
-                Y, D, H = apply_custom_ratios(Y_full, D_full, H_full, target, custom_ratios)
-
-                true_r_weights = np.array([custom_ratios[d] for d in target])
-                true_r_full = map_weights_to_full_source_list(true_r_weights, target, all_source_domains)
-
-                fp.write(
-                    f"\n{'=' * 100}\nTARGET: {target} | STRATEGY: {strategy_name}\nRATIOS: {np.round(true_r_full, 4)}\n{'=' * 100}\n")
-
-                baseline_text, oracle_epsilon = run_baselines(
-                    Y, D, H, target, target, all_source_domains, seed, true_r_weights
+                Y_full, D_full, H_full = build_DP_model_Classes(
+                    el,
+                    sum(len(l.dataset) for _, l in el),
+                    solver_source_domains,
+                    models,
+                    classifiers,
+                    normalize_factors,
+                    vae_norm_stats,
                 )
-                fp.write(baseline_text)
-                #     ############# TODO DELETE
-            #     if tuple(sorted(target)) == tuple(sorted(["amazon", "webcam"])) and strategy_name == "CONFIG_INVERSE":
-            #         print("\n" + "=" * 80)
-            #         print("RUNNING DEBUG FOR amazon/webcam + CONFIG_INVERSE")
-            #         print("=" * 80)
-            #
-            #         oracle_local = true_r_weights
-            #         uniform_local = np.ones(len(target)) / len(target)
-            #
-            #         # לפי הסדר של target = ['amazon', 'webcam']
-            #         dc_local = np.array([0.0005, 0.9995])
-            #         solver_local = np.array([0.500411, 0.49959])
-            #
-            #         debug_ce_mixture_case(
-            #             Y=Y,
-            #             D=D,
-            #             H=H,
-            #             source_domains=target,
-            #             oracle_w=oracle_local,
-            #             uniform_w=uniform_local,
-            #             dc_w=dc_local,
-            #             solver_w=solver_local,
-            #             single_source_name="webcam",
-            #             top_k_samples=15,
-            #         )
-            # #####################
 
-                results = Parallel(n_jobs=2, verbose=5)(
-                    delayed(run_solver_sweep_worker)(
-                        Y,
-                        D,
-                        H,
-                        e,
-                        target,
-                        all_source_domains,
-                        qstar_save_dir,
-                        strategy_name=strategy_name,
-                        target_domains=target,
-                        true_r_weights=true_r_weights,
-                        oracle_epsilon=oracle_epsilon,
-                    )
-                    for e in [1.0, 2.0]
-                )
-                for r in results: fp.write(r)
-                fp.flush()
-                del Y, D, H
+                del el
                 gc.collect()
 
-            del Y_full, D_full, H_full
             torch.cuda.empty_cache()
             gc.collect()
+
+            # -------------------------------------------------
+            # For each strategy: do subsample + baselines in parent
+            # Then collect flat solver jobs only on SMALL tensors
+            # -------------------------------------------------
+            flat_jobs = []
+            strategy_blocks = {}
+            strategy_order = []
+
+            for strategy_name, custom_ratios in weight_sets:
+                print(f"  -> Strategy: {strategy_name} | {custom_ratios}")
+                strategy_order.append(strategy_name)
+
+                Y, D, H = apply_custom_ratios(
+                    Y_full, D_full, H_full, target, custom_ratios
+                )
+
+                true_r_weights = np.array([
+                    custom_ratios[d] if d in custom_ratios else 0.0
+                    for d in solver_source_domains
+                ])
+
+                true_r_full = map_weights_to_full_source_list(
+                    true_r_weights, solver_source_domains, all_source_domains
+                )
+
+                header_buf = io.StringIO()
+                header_buf.write(
+                    f"\n{'=' * 100}\n"
+                    f"TARGET: {target} | STRATEGY: {strategy_name}\n"
+                    f"RATIOS: {np.round(true_r_full, 4)}\n"
+                    f"{'=' * 100}\n"
+                )
+
+                baseline_text, oracle_epsilon = run_baselines(
+                    Y, D, H,
+                    solver_source_domains,
+                    target,
+                    all_source_domains,
+                    seed,
+                    true_r_weights
+                )
+                header_buf.write(baseline_text)
+
+                strategy_blocks[strategy_name] = {
+                    "prefix_text": header_buf.getvalue(),
+                    "solver_texts": {},
+                }
+
+                for eps_mult in [1.0, 2.0]:
+                    flat_jobs.append(
+                        delayed(run_solver_job_flat)(
+                            Y=Y,
+                            D=D,
+                            H=H,
+                            eps_mult=eps_mult,
+                            source_domains=solver_source_domains,
+                            all_source_domains=all_source_domains,
+                            qstar_save_dir=qstar_save_dir,
+                            strategy_name=strategy_name,
+                            true_r_weights=true_r_weights,
+                            oracle_epsilon=oracle_epsilon,
+                        )
+                    )
+
+                del Y, D, H
+                del true_r_weights, true_r_full
+                del header_buf, baseline_text, oracle_epsilon
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            # -------------------------------------------------
+            # Full tensors no longer needed after all small jobs created
+            # -------------------------------------------------
+            del Y_full, D_full, H_full
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            # -------------------------------------------------
+            # One flat parallel call over the small jobs
+            # -------------------------------------------------
+            results = Parallel(n_jobs=4, verbose=5)(flat_jobs)
+
+            # -------------------------------------------------
+            # Collect results by strategy / epsilon
+            # -------------------------------------------------
+            for strategy_name, eps_mult, result_text in results:
+                strategy_blocks[strategy_name]["solver_texts"][eps_mult] = result_text
+
+            del results
+            gc.collect()
+
+            # -------------------------------------------------
+            # Single writer, deterministic order, no log corruption
+            # -------------------------------------------------
+            for strategy_name in strategy_order:
+                fp.write(strategy_blocks[strategy_name]["prefix_text"])
+                for eps_mult in [1.0, 2.0]:
+                    fp.write(strategy_blocks[strategy_name]["solver_texts"][eps_mult])
+
+            fp.flush()
+
+            # -------------------------------------------------
+            # Cleanup only AFTER writing finished
+            # -------------------------------------------------
+            del flat_jobs
+            del strategy_blocks
+            del strategy_order
+            gc.collect()
+            torch.cuda.empty_cache()
+
             print(f"✅ Finished all 3 sets for: {target}")
+
+    # optional final cleanup
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 def handle_vae_models(all_source_domains, classifiers, seed):
@@ -1207,14 +1423,27 @@ def main():
     n_gpus = torch.cuda.device_count()
     if n_gpus > 1:
         print(f"🚀 Detected {n_gpus} GPUs! Enabling DataParallel for feature extraction.")
+    # for d in ALL_DOMAINS_LIST:
+    #     # Check for both naming conventions in the consolidated ./classifiers folder
+    #     p1 = f"./classifiers/{d}_224.pt"
+    #     p2 = f"./classifiers/{d}_classifier.pt"
+    #     path = p1 if os.path.exists(p1) else p2
+    #
+    #     if not os.path.exists(path):
+    #         print(f"❌ Warning: Classifier for {d} not found in ./classifiers/")
+    #         continue
     for d in ALL_DOMAINS_LIST:
-        # Check for both naming conventions in the consolidated ./classifiers folder
-        p1 = f"./classifiers/{d}_224.pt"
-        p2 = f"./classifiers/{d}_classifier.pt"
+        # Load classifiers from the seed-specific directory.
+        # Example: ./classifiers_seed_101/amazon_224.pt
+
+        p1 = os.path.join(CLASSIFIERS_DIR, f"{d}_224.pt")
+        p2 = os.path.join(CLASSIFIERS_DIR, f"{d}_classifier.pt")
         path = p1 if os.path.exists(p1) else p2
 
         if not os.path.exists(path):
-            print(f"❌ Warning: Classifier for {d} not found in ./classifiers/")
+            print(f"❌ Warning: Classifier for {d} not found in {CLASSIFIERS_DIR}/")
+            print(f"   Tried: {p1}")
+            print(f"   Tried: {p2}")
             continue
 
         if DATASET_MODE == 'DIGITS':
@@ -1234,6 +1463,13 @@ def main():
                 extractor = nn.DataParallel(extractor)
             classifiers[d] = extractor.to(device).eval()
         print(f"✅ Loaded Classifier: {d}")
+
+    missing = [d for d in ALL_DOMAINS_LIST if d not in classifiers]
+    if missing:
+        raise RuntimeError(
+            f"Missing classifiers for domains={missing} in {CLASSIFIERS_DIR}. "
+            f"Do not run MSA with partial classifiers."
+        )
 
     task_run(classifiers, ALL_DOMAINS_LIST)
 
@@ -1431,6 +1667,7 @@ def debug_ce_mixture_case(
         "uniform_alpha": uniform_alpha,
         "solver_alpha": solver_alpha,
     }
+
 #--------------------------------------------------------------------
 if __name__ == "__main__":
     main()

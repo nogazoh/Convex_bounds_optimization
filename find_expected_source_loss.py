@@ -3,7 +3,6 @@ import numpy as np
 import pandas as pd
 import os
 import torch.nn.functional as F
-from datetime import datetime
 import torch.nn as nn
 from torchvision import models
 
@@ -11,8 +10,7 @@ import msa_all_summer as msa
 import classifier as ClSFR
 
 
-def calculate_source_self_performance():
-
+def calculate_cross_domain_performance():
     all_results = []
     dataset_modes = ["OFFICE224", "OFFICE31", "DOMAINNET"]
 
@@ -21,7 +19,6 @@ def calculate_source_self_performance():
 
         msa.DATASET_MODE = mode
         msa.CURRENT_CFG = msa.CONFIGS[mode]
-        msa.SOURCE_ERRORS = msa.CURRENT_CFG["SOURCE_ERRORS"]
         msa.ALL_DOMAINS_LIST = msa.CURRENT_CFG["DOMAINS"]
         msa.NUM_CLASSES = msa.CURRENT_CFG["CLASSES"]
         msa.D_PRECOMP_PATH = msa.CURRENT_CFG["D_PRECOMP_PATH"]
@@ -36,18 +33,18 @@ def calculate_source_self_performance():
         global_d = msa.load_global_D_matrix(msa.D_PRECOMP_PATH)
         domain_lengths = msa.compute_domain_lengths(domains)
 
-        for dom_name in domains:
-            print(f"  Processing domain: {dom_name}...")
+        for source_dom in domains:
+            print(f"\n  Loading source model: {source_dom}")
 
-            p1 = f"./classifiers/{dom_name}_224.pt"
-            p2 = f"./classifiers/{dom_name}_classifier.pt"
+            p1 = f"./classifiers/{source_dom}_224.pt"
+            p2 = f"./classifiers/{source_dom}_classifier.pt"
             model_path = p1 if os.path.exists(p1) else p2
 
             if not os.path.exists(model_path):
-                print(f"  [Skip] Classifier for {dom_name} not found.")
+                print(f"  [Skip] Classifier for {source_dom} not found.")
                 continue
 
-            if mode == 'DIGITS':
+            if mode == "DIGITS":
                 net = ClSFR.Grey_32_64_128_gp()
                 net.load_state_dict(torch.load(model_path, map_location=msa.device))
             else:
@@ -58,65 +55,93 @@ def calculate_source_self_performance():
 
             net.to(msa.device).eval()
 
-            _, test_loader, _, te_idx, _ = msa.get_train_test_loaders_and_indices(dom_name, seed=1)
+            source_col_idx = domains.index(source_dom)
 
-            d_dom_full = msa.slice_global_D_for_domain(global_d, domains, domain_lengths, dom_name)
-            dom_col_idx = domains.index(dom_name)
-            d_weights = d_dom_full[te_idx, dom_col_idx]  # (N_test_samples,)
+            for target_dom in domains:
+                _, test_loader, _, te_idx, _ = msa.get_train_test_loaders_and_indices(target_dom, seed=1)
 
-            all_losses = []
-            all_correct = []
+                # D block של target domain
+                d_target_full = msa.slice_global_D_for_domain(global_d, domains, domain_lengths, target_dom)
 
-            with torch.no_grad():
-                for imgs, labels in test_loader:
-                    imgs, labels = imgs.to(msa.device), labels.to(msa.device)
+                # העמודה של source_dom, רק עבור דגימות הטסט
+                d_weights = d_target_full[te_idx, source_col_idx]
 
-                    imgs = msa.fix_batch_resnet(imgs, mode)
+                all_correct = []
+                all_losses = []
 
-                    if mode == 'DIGITS':
-                        logits = net(imgs)
-                    else:
-                        _, logits = net(imgs)
+                with torch.no_grad():
+                    for imgs, labels in test_loader:
+                        imgs, labels = imgs.to(msa.device), labels.to(msa.device)
 
-                    loss_batch = F.cross_entropy(logits, labels, reduction='none').cpu().numpy()
-                    preds = logits.argmax(dim=1)
-                    correct_batch = (preds == labels).float().cpu().numpy()
+                        imgs = msa.fix_batch_resnet(imgs, mode)
 
-                    all_losses.extend(loss_batch)
-                    all_correct.extend(correct_batch)
+                        if mode == "DIGITS":
+                            logits = net(imgs)
+                        else:
+                            _, logits = net(imgs)
 
-            all_losses = np.array(all_losses)
-            all_correct = np.array(all_correct)
+                        preds = logits.argmax(dim=1)
+                        correct_batch = (preds == labels).float().cpu().numpy()
+                        loss_batch = F.cross_entropy(logits, labels, reduction="none").cpu().numpy()
 
-            classic_error = 1.0 - np.mean(all_correct)
-            classic_loss = np.mean(all_losses)
+                        all_correct.extend(correct_batch)
+                        all_losses.extend(loss_batch)
 
-            w_sum = np.sum(d_weights) + 1e-9
-            weighted_error = 1.0 - (np.sum(all_correct * d_weights) / w_sum)
-            weighted_loss = np.sum(all_losses * d_weights) / w_sum
+                all_correct = np.array(all_correct)
+                all_losses = np.array(all_losses)
+                d_weights = np.array(d_weights)
 
-            all_results.append({
-                "Dataset": mode,
-                "Domain": dom_name,
-                "Classic_Error": round(classic_error, 5),
-                "Weighted_Error": round(weighted_error, 5),
-                "Classic_Loss": round(classic_loss, 5),
-                "Weighted_Loss": round(weighted_loss, 5),
-                "N_Samples": len(all_correct)
-            })
+                # לא ממושקל
+                accuracy_percent = 100.0 * np.mean(all_correct)
+                error_percent = 100.0 * (1.0 - np.mean(all_correct))
+                mean_ce_loss = np.mean(all_losses)
+
+                # ממושקל לפי P_ij
+                w_sum = np.sum(d_weights) + 1e-12
+                weighted_accuracy_percent = 100.0 * (np.sum(all_correct * d_weights) / w_sum)
+                weighted_error_percent = 100.0 - weighted_accuracy_percent
+                weighted_ce_loss = np.sum(all_losses * d_weights) / w_sum
+
+                tag = "SELF" if source_dom == target_dom else "CROSS"
+                print(
+                    f"    [{tag}] {source_dom} -> {target_dom} | "
+                    f"Acc: {accuracy_percent:.2f}% | "
+                    f"W-Acc(Pij): {weighted_accuracy_percent:.2f}% | "
+                    f"CE: {mean_ce_loss:.5f} | "
+                    f"W-CE(Pij): {weighted_ce_loss:.5f}"
+                )
+
+                all_results.append({
+                    "Dataset": mode,
+                    "Source_Domain": source_dom,
+                    "Target_Domain": target_dom,
+                    "Accuracy": round(accuracy_percent, 2),
+                    "Weighted_Accuracy_Pij": round(weighted_accuracy_percent, 2),
+                    "Error": round(error_percent, 2),
+                    "Weighted_Error_Pij": round(weighted_error_percent, 2),
+                    "CrossEntropy_Loss": round(mean_ce_loss, 5),
+                    "Weighted_CrossEntropy_Loss_Pij": round(weighted_ce_loss, 5),
+                    "N_Samples": len(all_correct),
+                    "Weight_Sum": round(float(np.sum(d_weights)), 6),
+                    "Is_Self": source_dom == target_dom
+                })
 
     if all_results:
         df = pd.DataFrame(all_results)
-        filename = f"Source_Self_Performance.csv"
+        filename = "Cross_Domain_Performance_with_Pij.csv"
         df.to_csv(filename, index=False)
 
-        print("\n" + "=" * 50)
-        print(f"Results saved to: {filename}")
-        print("=" * 50)
-        print(df[["Dataset", "Domain", "Classic_Error", "Weighted_Error"]].to_string())
+        print("\n" + "=" * 90)
+        print(f"Results saved to: {os.path.abspath(filename)}")
+        print("=" * 90)
+
+        print(df[[
+            "Dataset", "Source_Domain", "Target_Domain",
+            "Accuracy", "Weighted_Accuracy_Pij", "Is_Self"
+        ]].to_string(index=False))
     else:
         print("No results were generated. Check your paths.")
 
 
 if __name__ == "__main__":
-    calculate_source_self_performance()
+    calculate_cross_domain_performance()

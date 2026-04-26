@@ -43,7 +43,7 @@ DOMAIN_CONFIGS = {
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 TOTAL_CPUS = os.cpu_count() or 1
-DATA_LOADER_WORKERS = 0 # min(8, max(2, TOTAL_CPUS // 4))
+DATA_LOADER_WORKERS = 8 # min(8, max(2, TOTAL_CPUS // 4))
 
 # --- Helper Classes ---
 

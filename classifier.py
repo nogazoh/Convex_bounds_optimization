@@ -6,6 +6,14 @@ os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
+# SEED = 1
+# SEED = 101
+SEED = 201
+# SEED = 301
+# SEED = 401
+
+RUN_TAG = f"seed_{SEED}"
+CLASSIFIERS_DIR = f"./classifiers_{RUN_TAG}"
 
 import ssl
 from joblib import Parallel, delayed
@@ -203,8 +211,8 @@ def test(network, test_loader):
     return acc
 
 
-def run_classifier(domain):
-    train_loader, test_loader, config = Data.get_data_loaders(domain)
+def run_classifier(domain, seed=SEED, classifiers_dir=CLASSIFIERS_DIR):
+    train_loader, test_loader, config = Data.get_data_loaders(domain, seed=seed)
     network = build_network(domain).to(Data.device)
 
     if domain in ['MNIST', 'USPS', 'SVHN']:
@@ -227,8 +235,8 @@ def run_classifier(domain):
     epsilon = 1e-4
     start_epoch = 1
 
-    checkpoint_path = f"./classifiers/{domain}_checkpoint.pt"
-    best_model_path = f"./classifiers/{domain}_224.pt"
+    checkpoint_path = os.path.join(classifiers_dir, f"{domain}_checkpoint.pt")
+    best_model_path = os.path.join(classifiers_dir, f"{domain}_224.pt")
 
     # Resume if checkpoint exists
     if os.path.exists(checkpoint_path):
@@ -293,17 +301,17 @@ def run_classifier(domain):
 
 # --- Parallel Execution Wrapper ---
 
-def parallel_wrapper(domain):
+def parallel_wrapper(domain, seed=SEED, classifiers_dir=CLASSIFIERS_DIR):
     print(f"--- Process starting for {domain} on PID {os.getpid()} ---")
 
-    checkpoint_path = f"./classifiers/{domain}_checkpoint.pt"
-    best_model_path = f"./classifiers/{domain}_224.pt"
-    legacy_model_path = f"./classifiers/{domain}_classifier.pt"
+    checkpoint_path = os.path.join(classifiers_dir, f"{domain}_checkpoint.pt")
+    best_model_path = os.path.join(classifiers_dir, f"{domain}_224.pt")
+    legacy_model_path = os.path.join(classifiers_dir, f"{domain}_classifier.pt")
 
     # If checkpoint exists -> resume training
     if os.path.exists(checkpoint_path):
         print(f"[{domain}] Checkpoint found. Resuming training.")
-        return run_classifier(domain)
+        return run_classifier(domain, seed=seed, classifiers_dir=classifiers_dir)
 
     # If only final model exists -> just evaluate it
     save_path = best_model_path if os.path.exists(best_model_path) else legacy_model_path
@@ -312,90 +320,92 @@ def parallel_wrapper(domain):
         try:
             model = build_network(domain).to(Data.device)
             model.load_state_dict(torch.load(save_path, map_location=Data.device))
-            _, test_loader, _ = Data.get_data_loaders(domain)
+            _, test_loader, _ = Data.get_data_loaders(domain, seed=seed)
             acc = test(model, test_loader)
             print(f"[{domain}] Existing model accuracy: {acc:.2f}%")
             return acc
         except Exception as e:
             print(f"[{domain}] Error loading final model: {e}. Re-training...")
 
-    return run_classifier(domain)
+    return run_classifier(domain, seed=seed, classifiers_dir=classifiers_dir)
 
 
 # --- Cross-Domain Evaluation Matrix ---
 
-def evaluate_cross_domain(domains):
-    print("\n" + "#" * 60)
-    print(">>> STARTING CROSS-DOMAIN EVALUATION MATRIX <<<")
-    print("#" * 60)
-
-    print("--> Pre-loading test datasets...")
-    test_loaders = {}
-    for d in domains:
-        _, test_loader, _ = Data.get_data_loaders(d)
-        test_loaders[d] = test_loader
-
-    results_matrix = {s: {} for s in domains}
-
-    for source in domains:
-        print(f"\n[Source Model: {source}] Loading weights...")
-
-        model = build_network(source).to(Data.device)
-
-        p1 = f"./classifiers/{source}_224.pt"
-        p2 = f"./classifiers/{source}_classifier.pt"
-        model_path = p1 if os.path.exists(p1) else p2
-
-        if not os.path.exists(model_path):
-            print(f"[WARNING] Model for {source} not found in ./classifiers/. Skipping.")
-            continue
-
-        try:
-            model.load_state_dict(torch.load(model_path, map_location=Data.device))
-            model.eval()
-        except Exception as e:
-            print(f"[ERROR] Could not load {source}: {e}")
-            continue
-
-        for target in domains:
-            loader = test_loaders[target]
-            correct = 0
-            total = 0
-
-            with torch.no_grad():
-                for i, (data, lbl) in enumerate(loader):
-                    if data.dim() == 3: data = data.unsqueeze(1)
-                    data = data.to(Data.device)
-                    lbl = lbl.to(Data.device)
-
-                    output = model(data)
-                    preds = output.argmax(dim=1)
-                    correct += preds.eq(lbl).sum().item()
-                    total += lbl.size(0)
-
-                    if i % 20 == 0:
-                        print(f"   [Eval] {source} -> {target}: Batch {i}/{len(loader)}", end='\r')
-
-            accuracy = correct / total
-            error = 1.0 - accuracy
-            results_matrix[source][target] = error
-
-            print(f"   -> Tested on {target:<10} | Acc: {accuracy:.2%} | Err: {error:.4f}")
-
-    print("\n" + "=" * 80)
-    print(f"{'SOURCE (Model) / TARGET (Data)':<30} | " + " | ".join([f"{d:<10}" for d in domains]))
-    print("-" * 80)
-
-    for source in domains:
-        row_str = f"{source:<30} | "
-        for target in domains:
-            err = results_matrix[source].get(target, -1)
-            if err == -1:
-                row_str += f"{'N/A':<10} | "
-            else:
-                row_str += f"{err:.4f}      | "
-        print(row_str)
-    print("=" * 80 + "\n")
+# def evaluate_cross_domain(domains):
+#     print("\n" + "#" * 60)
+#     print(">>> STARTING CROSS-DOMAIN EVALUATION MATRIX <<<")
+#     print("#" * 60)
+#
+#     print("--> Pre-loading test datasets...")
+#     test_loaders = {}
+#     for d in domains:
+#         _, test_loader, _ = Data.get_data_loaders(d)
+#         test_loaders[d] = test_loader
+#
+#     results_matrix = {s: {} for s in domains}
+#
+#     for source in domains:
+#         print(f"\n[Source Model: {source}] Loading weights...")
+#
+#         model = build_network(source).to(Data.device)
+#
+#         p1 = f"./classifiers/{source}_224.pt"
+#         p2 = f"./classifiers/{source}_classifier.pt"
+#
+#         model_path = p1 if os.path.exists(p1) else p2
+#
+#         if not os.path.exists(model_path):
+#
+#             print(f"[WARNING] Model for {source} not found in ./classifiers/. Skipping.")
+#             continue
+#
+#         try:
+#             model.load_state_dict(torch.load(model_path, map_location=Data.device))
+#             model.eval()
+#         except Exception as e:
+#             print(f"[ERROR] Could not load {source}: {e}")
+#             continue
+#
+#         for target in domains:
+#             loader = test_loaders[target]
+#             correct = 0
+#             total = 0
+#
+#             with torch.no_grad():
+#                 for i, (data, lbl) in enumerate(loader):
+#                     if data.dim() == 3: data = data.unsqueeze(1)
+#                     data = data.to(Data.device)
+#                     lbl = lbl.to(Data.device)
+#
+#                     output = model(data)
+#                     preds = output.argmax(dim=1)
+#                     correct += preds.eq(lbl).sum().item()
+#                     total += lbl.size(0)
+#
+#                     if i % 20 == 0:
+#                         print(f"   [Eval] {source} -> {target}: Batch {i}/{len(loader)}", end='\r')
+#
+#             accuracy = correct / total
+#             error = 1.0 - accuracy
+#             results_matrix[source][target] = error
+#
+#             print(f"   -> Tested on {target:<10} | Acc: {accuracy:.2%} | Err: {error:.4f}")
+#
+#     print("\n" + "=" * 80)
+#     print(f"{'SOURCE (Model) / TARGET (Data)':<30} | " + " | ".join([f"{d:<10}" for d in domains]))
+#     print("-" * 80)
+#
+#     for source in domains:
+#         row_str = f"{source:<30} | "
+#         for target in domains:
+#             err = results_matrix[source].get(target, -1)
+#             if err == -1:
+#                 row_str += f"{'N/A':<10} | "
+#             else:
+#                 row_str += f"{err:.4f}      | "
+#         print(row_str)
+#     print("=" * 80 + "\n")
 
 def sanity_check_domainnet(domains, classifiers_dir="./classifiers"):
     """
@@ -517,7 +527,7 @@ def sanity_check_domainnet(domains, classifiers_dir="./classifiers"):
 
         try:
             model.load_state_dict(torch.load(model_path, map_location=Data.device))
-            _, test_loader, _ = Data.get_data_loaders(d)
+            _, test_loader, _ = Data.get_data_loaders(d, seed=seed)
             acc = test(model, test_loader)
             print(f"  SELF ACCURACY ({d} -> {d}) = {acc:.2f}%")
         except Exception as e:
@@ -531,24 +541,28 @@ def sanity_check_domainnet(domains, classifiers_dir="./classifiers"):
 
 if __name__ == '__main__':
     # Ensure the directory matches the path used in the functions
-    save_dir = "./classifiers"
+    # TODO
+    # save_dir = "./classifiers"
+    # os.makedirs(save_dir, exist_ok=True)
+    save_dir = CLASSIFIERS_DIR
     os.makedirs(save_dir, exist_ok=True)
-
+    print(f"Saving models to: {save_dir}")
+    #####
     # CASE 2: Office-Home--------
-    # domains_to_run = ['Art', 'Clipart', 'Product', 'Real World']
+    domains_to_run = ['Art', 'Clipart', 'Product', 'Real World']
     # domains_to_run = ['amazon', 'dslr', 'webcam']
-    domains_to_run = ['clipart', 'infograph', 'painting' , 'quickdraw', 'real', 'sketch']
+    # domains_to_run = ['clipart', 'infograph', 'painting' , 'quickdraw', 'real', 'sketch']
     print(f"Running for domains: {domains_to_run}")
 
     num_jobs = 1 if torch.cuda.is_available() else min(len(domains_to_run), max(1, TOTAL_CPUS // 4))
     print(f"Using {num_jobs} parallel jobs out of {TOTAL_CPUS} CPUs")
 
-    # results = Parallel(n_jobs=num_jobs, backend="loky")(
-    #     delayed(parallel_wrapper)(d) for d in domains_to_run
-    # )
+    results = Parallel(n_jobs=num_jobs, backend="loky")(
+        delayed(parallel_wrapper)(d) for d in domains_to_run
+    )
 
     print("\n" + "=" * 30)
     print("INDIVIDUAL TRAINING COMPLETED")
     print("=" * 30)
 
-    evaluate_cross_domain(domains_to_run)
+    # evaluate_cross_domain(domains_to_run)
